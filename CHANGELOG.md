@@ -1,5 +1,104 @@
 # Changelog
 
+## [Unreleased] - 2026-05-20 — `kinbrowser` skill: markdown-native browser, replaces 5 web skills
+
+### Why
+
+User insight after surveying the agent-browser landscape: every existing
+solution (browser-use, Vercel agent-browser, BrowserOS, Lightpanda) is
+either a Chromium wrapper or a Chromium fork. None of them treat
+**markdown as the agent-native protocol**. But LLM training data is
+mostly markdown — handing the model rendered HTML costs 5-10× the
+tokens on `<div class="...">` cruft and forces re-parsing of structure
+the author originally wrote AS markdown.
+
+The realization unfolded in 3 stages over one conversation:
+
+1. **"Don't build a new browser engine"** — survey showed Lightpanda
+   already does that (Zig, 23k stars, no rendering, 11× faster than
+   Chrome headless). Reusing existing engines is the right call.
+2. **"Don't even need an engine for most pages"** — most agent reads
+   are static HTML where `http.GET + go-readability + html→markdown`
+   gets clean content in ~100ms. Lightpanda is escalation, not default.
+3. **"Don't cache everything"** — auto-saving every URL to KinBrain
+   would pollute the user's curated knowledge base with marketing
+   pages, expired articles, transient search results. Save must be
+   opt-in, explicit.
+
+Net design: a thin Go composer (3-layer escalation + optional KinBrain
+hook) sits on top of established backends. Shipped today as a separate
+public repo: [LocalKinAI/kinbrowser](https://github.com/LocalKinAI/kinbrowser).
+
+### What
+
+**`pkg/skill/kinbrowser.go`** (110 LoC) — KinClaw skill that shells
+out to the `kinbrowser` CLI. Two actions:
+
+| Action | Effect |
+|---|---|
+| `open` | Fetch URL, return markdown. Session-cached. No persistence. |
+| `archive` | Fetch + save to `~/.kinbrain/notes/<date>/web/`. Opt-in archiving for high-signal content. |
+
+Backed by `LocalKinAI/kinbrowser` (separate public repo, v0.1.0
+shipped same day). The CLI's 3 backends:
+
+```
+L1   http.Get + go-readability + html→markdown   ~100ms   ~80% of sites
+L2   Lightpanda over CDP (JS exec, no rendering) ~500ms   +15% opt-in
+L3   chromedp / full Chrome via CDP              ~2s      +5%
+```
+
+Smoke-tested on real URLs before commit:
+- arxiv 1706.03762 → L1, 183ms, 1.9 KB clean abstract
+- GitHub README → L1, 965ms, 13.2 KB
+- Hacker News front page → L1, 267ms, 15.8 KB / 30 posts
+
+### Pilot soul: 1 skill replaces 5
+
+`souls/pilot.soul.md` `skills.enable:` block updated:
+
+**Removed (commented for reference):**
+- `web_fetch` — covered by `kinbrowser open`
+- `web_search` — covered by `kinbrowser` + LLM-driven grep of result pages
+- `web` — covered by L3 (chromedp inside kinbrowser)
+- `web_scrape` — covered by L3 fallback
+- `browser_session` — multi-step interactions defer to v0.2
+
+**Added:**
+- `kinbrowser` — one skill, two actions, three transparent backends
+
+LLM tool table shrinks by 4 entries. Same coverage, one contract.
+
+### Design choices
+
+| Choice | Reason |
+|---|---|
+| Shell out, don't import pkg/kinbrowser | kinclaw stays self-contained public binary; no extra Go module deps |
+| Action enum (open/archive) over separate skills | LLM tool table compact, mirrors kinbrain pattern |
+| Hardcoded `--quiet` flag | LLM doesn't need "[kinbrowser] L1 http \| ..." decoration; that's for humans |
+| Register unconditionally | Read-mostly; soul opt-in via `permissions.skills.enable` |
+| Validate action+url BEFORE `LookPath` | Bad params get a useful error, not "install kinbrowser" |
+| KEEP old 5 skills in registry (just don't enable) | Existing souls that haven't migrated yet still work |
+
+### Files
+
+    pkg/skill/kinbrowser.go             NEW   110 LoC
+    pkg/skill/kinbrowser_test.go        NEW    87 LoC (4 tests, all pass)
+    cmd/kinclaw/main.go                 MOD   +7 lines (reg.Register)
+    souls/pilot.soul.md                 MOD   swap 5 web skills for kinbrowser
+    CHANGELOG.md                        MOD   this entry
+
+### Lineage
+
+This is the 4th in the kin-* skill family that follows the same shape:
+**KinClaw skill = thin wrapper that shells out to a sibling kin-*
+binary**. Same pattern as `kinbrain` skill (LocalKin's kinbrain CLI),
+`kin_audio` (kinkit), `kin_listen/kin_speak` (kinkit). The skill layer
+stays minimal; the heavy lifting lives in standalone open-source
+binaries you can install independently.
+
+---
+
 ## [Unreleased] - 2026-05-17 — kinbrain skill: pass `--limit 50` to keep tool-result payloads sane
 
 ### Bug observed in the wild

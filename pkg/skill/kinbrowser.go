@@ -1,0 +1,120 @@
+package skill
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os/exec"
+	"strings"
+)
+
+// kinbrowserSkill exposes the kinbrowser CLI as a KinClaw tool —
+// markdown-native fetch over web URLs.
+//
+// kinbrowser (https://github.com/LocalKinAI/kinbrowser) is a separate
+// public binary that fetches a URL through a 3-layer escalating chain
+// (HTTP + readability + html→markdown ➜ Lightpanda ➜ chromedp) and
+// returns clean markdown. Same contract as the kinbrain skill: we shell
+// out to the binary rather than importing pkg/kinbrowser, so kinclaw
+// stays a self-contained public binary with no extra Go module deps.
+//
+// REPLACES (when enabled in a soul): web_fetch, web_search, web,
+// browser_session, web_scrape — one tool with 5× less surface area.
+//
+// Two actions:
+//
+//	open     — fetch URL, return markdown. Session-cached, no persistence.
+//	archive  — fetch + save to KinBrain (~/.kinbrain/notes/<date>/web/).
+//	           Opt-in: agents should only archive high-signal content,
+//	           leaving KinBrain curated.
+//
+// If `kinbrowser` isn't on PATH, Execute returns a clear install hint.
+// The skill stays registered unconditionally (souls that don't enable
+// it via permissions.skills.enable see nothing).
+type kinbrowserSkill struct{}
+
+// NewKinBrowserSkill constructs the skill. No config — kinbrowser's
+// own flags (--lightpanda, --no-chrome, --cache, --timeout) are not
+// surfaced to the LLM; we accept the binary's sensible defaults
+// (Layer 1+3 enabled, 128-entry LRU, 30s timeout). If you want
+// Lightpanda (Layer 2), set up `kinbrowser` with the right env or
+// run a wrapper script — keeps the skill simple.
+func NewKinBrowserSkill() Skill { return &kinbrowserSkill{} }
+
+func (s *kinbrowserSkill) Name() string { return "kinbrowser" }
+
+func (s *kinbrowserSkill) Description() string {
+	return "Markdown-native browser for fetching web pages. " +
+		"Returns extracted main content as clean markdown (strips " +
+		"nav/footer/ads/JS cruft). Three escalating backends behind " +
+		"one interface: HTTP+readability (~100ms, 80% of sites) → " +
+		"Lightpanda (JS exec, ~500ms) → chromedp full Chrome (~2s). " +
+		"Replaces the older web_fetch/web_search/web/browser_session/" +
+		"web_scrape skills with one uniform tool. " +
+		"Two actions: 'open' (read + return markdown, no persistence) " +
+		"and 'archive' (read + save to KinBrain notes/ for future " +
+		"recall — opt-in, only for high-signal content like papers, " +
+		"docs, authoritative sources). Backed by the `kinbrowser` " +
+		"CLI from LocalKinAI/kinbrowser; install with `go install " +
+		"github.com/LocalKinAI/kinbrowser/cmd/kinbrowser@latest`."
+}
+
+func (s *kinbrowserSkill) ToolDef() json.RawMessage {
+	return MakeToolDef("kinbrowser", s.Description(),
+		map[string]map[string]string{
+			"action": {
+				"type":        "string",
+				"description": "'open' (fetch + return markdown) or 'archive' (fetch + persist to KinBrain).",
+			},
+			"url": {
+				"type": "string",
+				"description": "Full URL (https://...). HTTP fallback is automatic. " +
+					"For most sites (blogs, docs, GitHub, arxiv, news, HN, Reddit, Wikipedia) " +
+					"Layer 1 returns in ~100ms. Only SPA/JS-heavy sites escalate.",
+			},
+		},
+		[]string{"action", "url"},
+	)
+}
+
+func (s *kinbrowserSkill) Execute(params map[string]string) (string, error) {
+	action := params["action"]
+	url := strings.TrimSpace(params["url"])
+
+	switch action {
+	case "open", "archive":
+		// fall through after validation
+	case "":
+		return "", errors.New("kinbrowser: 'action' is required ('open' or 'archive')")
+	default:
+		return "", fmt.Errorf("kinbrowser: unknown action %q (use 'open' or 'archive')", action)
+	}
+
+	if url == "" {
+		return "", errors.New("kinbrowser: 'url' is required")
+	}
+
+	if _, err := exec.LookPath("kinbrowser"); err != nil {
+		return "", errors.New(
+			"kinbrowser CLI not found on PATH. Install:\n" +
+				"  go install github.com/LocalKinAI/kinbrowser/cmd/kinbrowser@latest\n" +
+				"Then verify with `kinbrowser version`.")
+	}
+
+	// --quiet so the LLM doesn't see the "[kinbrowser] L1 http | ..."
+	// stderr decoration line on every call (we surface fetch metadata
+	// inside the markdown header instead, or just trust the caller).
+	cmd := exec.Command("kinbrowser", action, "--quiet", "--", url)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("kinbrowser %s: %w\n%s", action, err, stderr.String())
+	}
+
+	out := stdout.String()
+	if strings.TrimSpace(out) == "" {
+		return "(kinbrowser returned empty content for " + url + ")", nil
+	}
+	return out, nil
+}

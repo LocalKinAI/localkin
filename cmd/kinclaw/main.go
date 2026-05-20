@@ -292,6 +292,13 @@ func buildRegistry(s *soul.Soul, store *memory.SQLiteStore) *skill.Registry {
 	// Registered unconditionally — recall is read-only, save writes
 	// one Markdown file. Souls opt-in via permissions.skills.enable.
 	reg.Register(skill.NewKinBrainSkill())
+	// KinBrowser — markdown-native browser. Shells out to the
+	// `kinbrowser` CLI (from LocalKinAI/kinbrowser). Returns extracted
+	// main content as clean markdown via 3-layer escalation
+	// (HTTP+readability → Lightpanda → chromedp). Designed to replace
+	// the older web_fetch/web_search/web/browser_session/web_scrape
+	// skills — one tool, one contract (URL → markdown). Souls opt-in.
+	reg.Register(skill.NewKinBrowserSkill())
 	// KinClaw computer-use claws — macOS only; each gated by its own bit.
 	// On non-darwin builds these register no-op skills that return a clean
 	// "macOS-only" error.

@@ -62,8 +62,6 @@ skills:
     - "file_read"
     - "file_write"
     - "file_edit"
-    - "web_fetch"
-    - "web_search"
     - "forge"
     - "tts"
     - "stt"
@@ -71,9 +69,13 @@ skills:
     - "learn"            # append cross-session lesson to learned.md (技术性 doctrine)
     - "memory"           # 跨 session key-value 长期记忆 — 用户的人 / 偏好 / 项目 state
     - "kinbrain"         # 跨 session + 跨 agent 的累积知识库 — recall 蜂群 6 月写的 1,500+ 分析 + 230MB 语料 (output / knowledge / input / notes 四 root grep);save 新洞察到 ~/.kinbrain/notes/。每次新任务前先 recall("…") 看蜂群 / Jacky 有没有写过 — 比 memory 大几个量级
-    - "web"              # 万能 web skill — Playwright-driven,覆盖 fetch / wait / click / type / screenshot
-    - "web_scrape"       # Scrapling — 反 bot (Cloudflare/Akamai/DataDome)、TLS 指纹、比 web 快;web_search 撞墙时的备路
-    - "browser_session"  # super-skill: 包 browser-use,多步 web 任务 (登录+导航+提取),用 vs `web` 看任务复杂度
+    - "kinbrowser"       # ★ 2026-05-20 替代以下 5 个 web 爪 ★ Markdown-native browser. 3 层 escalation: HTTP+readability+html→md (~100ms, 80% 站点) → Lightpanda CDP (~500ms) → chromedp 全 Chrome (~2s). 永远输出 markdown 给 LLM 直接读 (省 5-10× tokens vs HTML). action=open 读 + 不存,action=archive 存到 KinBrain ~/.kinbrain/notes/web/ (opt-in,只存 paper/doc/权威源,普通浏览不存避免污染 KinBrain). 替代 web_fetch/web_search/web/browser_session/web_scrape
+    # 历史 web 爪保留但 不 enable —— 1 个 kinbrowser 替代下面 5 个:
+    # - "web_fetch"      # 已被 kinbrowser open 覆盖
+    # - "web_search"     # 已被 kinbrowser + LLM 自己 grep 结果覆盖
+    # - "web"            # 已被 kinbrowser Layer 3 (chromedp) 覆盖
+    # - "web_scrape"     # 已被 kinbrowser fallback 覆盖
+    # - "browser_session" # 多步交互场景留待 v0.2 加 kinbrowser session 支持
     - "location"         # 实时 GPS via corelocationcli
     - "spawn"            # 派子 agent (researcher 查信息 / eye 看图 / critic 审产物)
     - "todo_write"       # 多步任务 plan,KinClaw Mac 渲染成可见 checklist
