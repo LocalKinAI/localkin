@@ -665,6 +665,71 @@ script, validates syntax, registers it in the live registry, and
 retries the original task. See `pkg/skill/native.go` for the forge
 skill.
 
+## `kinbrain` — query accumulated knowledge (2026-05-17)
+
+KinClaw ships a `kinbrain` skill that shells out to the `kinbrain`
+CLI from [LocalKinAI/localkin-core](https://github.com/LocalKinAI/localkin-core).
+The CLI is a 4-root unified grep view over:
+
+| Root | Contents |
+|------|----------|
+| `~/.kinbrain/notes/` | your manual notes (writable) |
+| `$LOCALKIN_HOME/output/` | the swarm's distilled markdowns (~1,500 files / 14 MB across 50+ agents) |
+| `$LOCALKIN_HOME/knowledge/` | curated canon (bible 5 versions / 19 MB) |
+| `$LOCALKIN_HOME/input/` | bulk source corpora (~200 MB spiritual + TCM classics) |
+
+Today's total: **3,150+ entries / 230 MB** queryable in one tool call.
+No DB, no vector store — paper #4 grep-is-all-you-need extended to
+a slow-accumulating personal corpus.
+
+### Two actions
+
+The LLM sees one tool, `kinbrain`, with an `action` parameter:
+
+- **`recall`** — grep across all roots, returns matching paths grouped
+  by root with hit counts. Call this BEFORE doing novel research:
+  there's a very good chance the swarm or Jacky already wrote about it.
+- **`save`** — append a short note to `~/.kinbrain/notes/<date>/kinclaw/`
+  after finishing a task that produced a reusable insight.
+
+Source bucket is hardcoded to `kinclaw` on save so claw-captured notes
+are visually distinct from manual `kinbrain save thought` entries when
+browsing `~/.kinbrain/notes/<date>/`.
+
+### Install
+
+```bash
+# 1. Build + install the kinbrain CLI (one-time)
+cd ~/Documents/Workspace/localkin && go install ./cmd/kinbrain
+kinbrain version    # → kinbrain v0.2.0 (localkin-core, 4-root: ...)
+
+# 2. Optional but strongly recommended for 100MB+ corpora:
+brew install ripgrep
+# → 60s cold cache (BSD grep) → 0.5s (ripgrep). kinbrain auto-detects.
+
+# 3. Enable in your soul YAML:
+#    permissions.skills.enable: [shell, kinbrain, ...]
+```
+
+Without `kinbrain` on PATH the skill stays registered but Execute()
+returns a clear "install kinbrain" error — souls that never enable it
+see nothing.
+
+### Soul prompt hint (recommended)
+
+Add to system prompt so the LLM remembers to use it:
+
+```
+KNOWLEDGE LOOKUP — before doing novel research or writing code, ALWAYS
+try `kinbrain` with action=recall first. The swarm has written 1,500+
+markdown analyses across 80+ agents over 6 months; the spiritual /
+TCM corpora hold 230 MB of curated text. Find it before redoing the
+work.
+```
+
+Source: [`pkg/skill/kinbrain.go`](pkg/skill/kinbrain.go) (KinClaw side),
+[`LocalKinAI/localkin-core/pkg/kinbrain/`](https://github.com/LocalKinAI/localkin-core/tree/main/pkg/kinbrain) (the brain itself).
+
 ## Skill harvest — `kinclaw harvest`
 
 `kinclaw harvest` pulls candidate `SKILL.md` files from other agent

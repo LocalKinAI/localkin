@@ -1,5 +1,109 @@
 # Changelog
 
+## [Unreleased] - 2026-05-17 — `kinbrain` skill: query Jacky's accumulated knowledge
+
+### Why
+
+KinClaw could do things on the Mac but had **no persistent memory or
+knowledge access**. Each session it re-discovered: how to rename a
+folder in Finder, what the user said about TCM dryness last week,
+which Madame Guyon passage matched a devotional theme. The swarm
+(LocalKin) has been writing 1,500+ distilled markdown analyses across
+50+ agents for 6 months, plus 200 MB of curated spiritual + TCM
+classics — but none of that was reachable from KinClaw.
+
+User framing:
+
+> 我不是有 kinclaw 吗，我是想给他一个 kinbrain 啊。
+
+### What
+
+**`pkg/skill/kinbrain.go`** (140 LoC) — a new Skill that exposes one
+tool, `kinbrain`, with two actions:
+
+| Action | Behavior |
+|---|---|
+| `recall` | grep across all 4 kinbrain roots (notes / output / knowledge / input), return paths grouped by root with hit counts |
+| `save`   | append a note to `~/.kinbrain/notes/<date>/kinclaw/` for future recall |
+
+Backed by the `kinbrain` CLI (LocalKin's `cmd/kinbrain`). The skill
+shells out via `os/exec` rather than importing the Go package, because
+the kinbrain source lives in the private `localkin-core` repo while
+KinClaw is public — keeping the dependency closure clean.
+
+If the `kinbrain` binary isn't on PATH, Execute returns a precise
+error pointing at `go install github.com/LocalKinAI/localkin-core/cmd/kinbrain`.
+The skill stays registered unconditionally — souls that never enable
+it via `permissions.skills.enable: [kinbrain]` see nothing.
+
+### Coverage
+
+On Jacky's machine right now:
+
+    $ kinbrain stats
+    notes        0 entries        0 B
+    output    1,553 entries     14.0 MB    (50 agents, 6 months distilled)
+    knowledge     6 entries     18.7 MB    (bible 5 versions)
+    input     1,592 entries    198.1 MB    (spiritual + TCM classics)
+    total     3,151 entries    230.8 MB
+
+    $ kinbrain recall "Madame Guyon"
+    output (223) ━━━ 223 swarm-written analyses
+    input (37)  ━━━ 37 places in her original works
+
+That's 260 hits the LLM can pull in one tool call instead of
+re-deriving the answer from scratch.
+
+### Design decisions
+
+| Choice | Reason |
+|---|---|
+| Shell out, don't `import` | localkin-core is private; kinclaw is public — keeps go.mod clean |
+| One skill with `action` param (not three skills) | LLM tool table stays short; matches the `kinbrain` CLI's verb-then-action pattern |
+| Register unconditionally | recall is read-only; save writes one Markdown file; no new permission bit needed |
+| Validate `action` BEFORE `LookPath("kinbrain")` | Bad action → "use recall/save" is more useful than "install kinbrain"; both can fail in sequence |
+| `save` source = `"kinclaw"` (hardcoded) | Claw-captured notes are visually distinct from manual `kinbrain save thought` entries when browsing `~/.kinbrain/notes/<date>/<source>/` |
+
+### Files
+
+    pkg/skill/kinbrain.go             NEW   140 LoC
+    pkg/skill/kinbrain_test.go        NEW    90 LoC (4 tests)
+    cmd/kinclaw/main.go               MOD   +6 lines (reg.Register call)
+    README.md                         MOD   new "kinbrain" section
+    CHANGELOG.md                      MOD   this entry
+
+    Total: 5 files, 236 LoC + docs
+
+### Tests
+
+    go build ./...                                          pass
+    go vet ./pkg/skill/... ./cmd/kinclaw/...                clean
+    gofmt -l pkg/skill/kinbrain.go pkg/skill/kinbrain_test.go  clean
+    go test ./pkg/skill -run TestKinBrain -v                4/4 pass
+
+### Install steps (operator)
+
+```bash
+# 1. Install the kinbrain CLI from your localkin checkout
+cd ~/Documents/Workspace/localkin && go install ./cmd/kinbrain
+
+# 2. Strongly recommended for >100MB corpora: ripgrep
+brew install ripgrep   # kinbrain auto-detects; 60s → 0.5s cold cache
+
+# 3. Rebuild kinclaw to pick up the new skill
+cd ~/Documents/Workspace/kinclaw && go install ./cmd/kinclaw
+
+# 4. Enable in soul YAML:
+#    permissions.skills.enable: [shell, kinbrain, ...]
+
+# 5. Verify
+kinbrain version
+kinclaw -soul souls/<your-soul>.soul.md
+# then say: "recall what the swarm wrote about Madame Guyon"
+```
+
+---
+
 ## [Unreleased] - 2026-05-12 (overnight) — Phase 6: Windows port
 
 After the user went to sleep ("把windows也做了吧，我先睡觉了，你自己补齐所有")

@@ -285,6 +285,13 @@ func buildRegistry(s *soul.Soul, store *memory.SQLiteStore) *skill.Registry {
 	if store != nil {
 		reg.Register(skill.NewMemorySkill(store))
 	}
+	// KinBrain — read-mostly view across Jacky's accumulated knowledge
+	// (~/.kinbrain/notes/ + localkin/output/ + localkin/knowledge/ +
+	// localkin/input/). Shells out to the `kinbrain` CLI; degrades
+	// gracefully with a clear "install kinbrain" error if absent.
+	// Registered unconditionally — recall is read-only, save writes
+	// one Markdown file. Souls opt-in via permissions.skills.enable.
+	reg.Register(skill.NewKinBrainSkill())
 	// KinClaw computer-use claws — macOS only; each gated by its own bit.
 	// On non-darwin builds these register no-op skills that return a clean
 	// "macOS-only" error.
