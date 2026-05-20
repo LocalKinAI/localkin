@@ -69,9 +69,15 @@ func (s *kinbrowserSkill) ToolDef() json.RawMessage {
 			},
 			"url": {
 				"type": "string",
-				"description": "Full URL (https://...). HTTP fallback is automatic. " +
-					"For most sites (blogs, docs, GitHub, arxiv, news, HN, Reddit, Wikipedia) " +
-					"Layer 1 returns in ~100ms. Only SPA/JS-heavy sites escalate.",
+				"description": "Full URL (https://...) of a specific content page (article, " +
+					"paper, doc, README, post). DO NOT pass search-engine URLs " +
+					"(google.com/search, bing.com/search, duckduckgo.com/?q=...) " +
+					"— those return bot-challenge pages, not results. For search " +
+					"queries use the `web_search` skill, then pass the result " +
+					"URLs to kinbrowser one at a time. For PDFs (arxiv /pdf/) " +
+					"kinbrowser auto-detects content-type and extracts text. " +
+					"Layer 1 (~100ms) handles ~80% of sites; SPAs escalate to " +
+					"L2 (Lightpanda) or L3 (Chrome) transparently.",
 			},
 		},
 		[]string{"action", "url"},
