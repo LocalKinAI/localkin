@@ -63,11 +63,17 @@ func (s *kinbrainSkill) ToolDef() json.RawMessage {
 		map[string]map[string]string{
 			"action": {
 				"type":        "string",
-				"description": "'recall' (search) or 'save' (write a note)",
+				"description": "'recall' (grep) or 'save' (write a note)",
 			},
 			"query": {
-				"type":        "string",
-				"description": "For 'recall': the search query, e.g. 'Madame Guyon' or 'how to rename Finder folder'. Grep-style — case-insensitive substring match across all roots.",
+				"type": "string",
+				"description": "For 'recall': ONE keyword or short literal phrase. " +
+					"kinbrain is LITERAL grep, NOT a search engine — a multi-word " +
+					"query like '腓立比书 Philippians 保罗' will only match files " +
+					"containing that ENTIRE 4-token string verbatim (almost never " +
+					"exists). For breadth, call recall multiple times with single " +
+					"keywords: '腓立比书' (16 hits), then 'Philippians' (6 hits), " +
+					"then '保罗' (5 hits). Then file_read the most promising paths.",
 			},
 			"title": {
 				"type":        "string",
@@ -134,10 +140,32 @@ func (s *kinbrainSkill) recall(query string) (string, error) {
 	if extra := strings.TrimSpace(stderr.String()); extra != "" {
 		out += "\n" + extra
 	}
-	if strings.TrimSpace(out) == "" {
-		return "(no matches in any kinbrain root)", nil
+	if !strings.Contains(out, "no matches in any root") && strings.TrimSpace(out) != "" {
+		return out, nil
 	}
-	return out, nil
+
+	// No matches. If the query was multi-token (whitespace inside),
+	// the LLM probably treated kinbrain like a search engine. Give it
+	// a targeted hint with the actual single-token retries it should
+	// run next — this short-circuits the no-progress loop that
+	// KinClaw's circuit breaker would otherwise trip after 3 retries.
+	tokens := strings.Fields(query)
+	if len(tokens) > 1 {
+		var sb strings.Builder
+		fmt.Fprintf(&sb,
+			"(no matches for the EXACT phrase %q)\n\n"+
+				"kinbrain is LITERAL grep, NOT a search engine. Multi-token "+
+				"queries match the entire phrase verbatim. The %d tokens you "+
+				"joined with spaces almost certainly each exist on their own.\n\n"+
+				"NEXT — retry with single keywords:\n",
+			query, len(tokens))
+		for _, t := range tokens {
+			fmt.Fprintf(&sb, "  kinbrain.recall(query=%q)\n", t)
+		}
+		sb.WriteString("\nThen file_read the most promising paths from each.")
+		return sb.String(), nil
+	}
+	return "(no matches in any kinbrain root for " + query + ")", nil
 }
 
 func (s *kinbrainSkill) save(title, body string) (string, error) {

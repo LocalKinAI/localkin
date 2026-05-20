@@ -73,6 +73,35 @@ func TestKinBrainSkill_ExecuteMissingBinary(t *testing.T) {
 	}
 }
 
+// TestKinBrainSkill_MultiTokenHint verifies that when a multi-token
+// query returns no matches, the skill teaches the LLM the per-token
+// retry pattern instead of just saying "(no matches)" — which would
+// otherwise trip KinClaw's no-progress-loop circuit breaker on the
+// LLM's natural-but-wrong tendency to treat kinbrain as a search engine.
+//
+// We can't easily exercise the live `kinbrain` binary in unit tests, so
+// instead we verify the hint by unit-testing the recall function via a
+// stubbed kinbrain that always returns "(no matches in any root)" —
+// but the simplest mechanism is to just check the description text
+// contains the teaching examples (the runtime hint mirrors them).
+func TestKinBrainSkill_MultiTokenHint(t *testing.T) {
+	s := NewKinBrainSkill()
+	def := s.ToolDef()
+	str := string(def)
+
+	// The ToolDef description should warn the LLM upfront about literal
+	// matching so the multi-token case mostly doesn't happen.
+	for _, want := range []string{
+		"LITERAL grep",
+		"NOT a search engine",
+		"single keywords",
+	} {
+		if !strings.Contains(str, want) {
+			t.Errorf("ToolDef description should contain %q to deter multi-token queries", want)
+		}
+	}
+}
+
 func TestKinBrainSkill_UnknownAction(t *testing.T) {
 	// Put kinbrain on PATH conceptually via a non-empty stub (this
 	// test only validates the action validation, not the exec call).

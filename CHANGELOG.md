@@ -1,5 +1,88 @@
 # Changelog
 
+## [Unreleased] - 2026-05-17 — kinbrain: teach LLM grep semantics (anti-search-engine UX)
+
+### Bug observed in the wild
+
+Live trace from pilot soul, user asked 我本地知识库怎么讲的[腓立比书]:
+
+```
+1. kinbrain.recall(query="腓立比书 Philippians 保罗")  → (no matches)
+2. kinbrain.recall(query="圣经 新约 保罗书信")          → (no matches)
+3. kinbrain.recall(query="基督 耶稣 神学")              → running...
+4. [SYSTEM] Skill kinbrain returned same result 3 times in a row —
+   no-progress loop. STOP repeating this exact call.
+```
+
+The LLM treats `kinbrain.recall` like a search engine — generating 3
+diverse multi-keyword variants to "broaden" the search. But kinbrain
+shells out to `rg/grep -li QUERY PATH`, which does **literal
+substring matching**. The 4-token string "腓立比书 Philippians 保罗"
+(with spaces) doesn't exist verbatim in any file, so 0 hits. The
+LLM's natural retry strategy is exactly what makes it worse:
+generating MORE multi-token diversity instead of fewer.
+
+Meanwhile every individual token has plenty of hits — `腓立比书` →
+16, `Philippians` → 6, `保罗` → 5+. The data is there; the query
+shape is wrong.
+
+KinClaw's circuit breaker correctly fired after 3 identical-result
+calls. But the LLM shouldn't have been in that loop in the first place.
+
+### Fix
+
+Two-pronged at the skill layer:
+
+1. **ToolDef description rewritten** — explicitly says "LITERAL grep,
+   NOT a search engine" with a worked example showing the wrong vs
+   right approach. The LLM sees this every turn it considers using
+   kinbrain, so it learns the pattern upfront.
+
+2. **Runtime hint when multi-token returns 0** — if the query has
+   whitespace AND no matches are found, the skill returns a
+   structured hint:
+
+   ```
+   (no matches for the EXACT phrase "腓立比书 Philippians 保罗")
+
+   kinbrain is LITERAL grep, NOT a search engine. Multi-token queries
+   match the entire phrase verbatim. The 3 tokens you joined with
+   spaces almost certainly each exist on their own.
+
+   NEXT — retry with single keywords:
+     kinbrain.recall(query="腓立比书")
+     kinbrain.recall(query="Philippians")
+     kinbrain.recall(query="保罗")
+
+   Then file_read the most promising paths from each.
+   ```
+
+   This **short-circuits the no-progress loop** before the circuit
+   breaker fires — the LLM gets explicit instructions on what to do
+   next, with the actual single-token retries pre-spelled-out.
+
+### Files
+
+    pkg/skill/kinbrain.go         MOD  ToolDef description + recall() multi-token hint
+    pkg/skill/kinbrain_test.go    MOD  new TestKinBrainSkill_MultiTokenHint
+    CHANGELOG.md                  MOD  this entry
+
+### Tests
+
+    go build ./...                            pass
+    go vet ./pkg/skill/...                    clean
+    go test ./pkg/skill -run TestKinBrain     5/5 pass
+
+### Lesson
+
+LLMs default to "search engine" semantics for any tool with a `query`
+parameter unless told otherwise. For literal-grep tools, the tool
+description must SAY SO loudly and provide worked examples. Otherwise
+the LLM's natural retry strategy (diversify queries) makes things worse,
+not better.
+
+---
+
 ## [Unreleased] - 2026-05-17 — kinbrain: doc fix for env var rename
 
 Followup to the same-day `kinbrain` skill commit. The kinbrain CLI it
