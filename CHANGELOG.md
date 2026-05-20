@@ -1,5 +1,34 @@
 # Changelog
 
+## [Unreleased] - 2026-05-17 — kinbrain: doc fix for env var rename
+
+Followup to the same-day `kinbrain` skill commit. The kinbrain CLI it
+shells out to renamed its env var `LOCALKIN_HOME` → `LOCALKIN_REPO`
+because the former collides with Jacky's `localkin-service-audio` PyPI
+package (which sets `LOCALKIN_HOME=/Volumes/Data/.localkin-service-audio`).
+
+Only doc / comment changes here — the skill itself doesn't read either
+env var (the kinbrain CLI does, on the other side of the exec
+boundary). Updated:
+
+    pkg/skill/kinbrain.go    MOD  godoc env reference
+    README.md                MOD  $LOCALKIN_HOME → $LOCALKIN_REPO (3 occurrences)
+    CHANGELOG.md             MOD  this entry
+
+### How the bug looked
+
+    $ kinbrain recall "Madame Guyon"
+    (no matches in any root)              ← silent: kinbrain saw the env,
+                                            pointed roots at a directory
+                                            that doesn't have output/,
+                                            filtered them all out
+
+The fix is on the LocalKin side (commit on localkin-core); this entry
+exists so the kinclaw CHANGELOG history mentions the rename for anyone
+later reading kinclaw docs that reference `$LOCALKIN_HOME`.
+
+---
+
 ## [Unreleased] - 2026-05-17 — `kinbrain` skill: query Jacky's accumulated knowledge
 
 ### Why

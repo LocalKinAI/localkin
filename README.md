@@ -674,9 +674,9 @@ The CLI is a 4-root unified grep view over:
 | Root | Contents |
 |------|----------|
 | `~/.kinbrain/notes/` | your manual notes (writable) |
-| `$LOCALKIN_HOME/output/` | the swarm's distilled markdowns (~1,500 files / 14 MB across 50+ agents) |
-| `$LOCALKIN_HOME/knowledge/` | curated canon (bible 5 versions / 19 MB) |
-| `$LOCALKIN_HOME/input/` | bulk source corpora (~200 MB spiritual + TCM classics) |
+| `$LOCALKIN_REPO/output/` | the swarm's distilled markdowns (~1,500 files / 14 MB across 50+ agents) |
+| `$LOCALKIN_REPO/knowledge/` | curated canon (bible 5 versions / 19 MB) |
+| `$LOCALKIN_REPO/input/` | bulk source corpora (~200 MB spiritual + TCM classics) |
 
 Today's total: **3,150+ entries / 230 MB** queryable in one tool call.
 No DB, no vector store — paper #4 grep-is-all-you-need extended to

@@ -37,7 +37,7 @@ type kinbrainSkill struct{}
 
 // NewKinBrainSkill constructs the skill. No config — paths and
 // preferences are entirely owned by the kinbrain binary
-// ($KINBRAIN_HOME, $LOCALKIN_HOME). KinClaw just hands it queries.
+// ($KINBRAIN_HOME, $LOCALKIN_REPO). KinClaw just hands it queries.
 func NewKinBrainSkill() Skill { return &kinbrainSkill{} }
 
 func (s *kinbrainSkill) Name() string { return "kinbrain" }
