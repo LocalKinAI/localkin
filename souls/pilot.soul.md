@@ -69,13 +69,26 @@ skills:
     - "learn"            # append cross-session lesson to learned.md (技术性 doctrine)
     - "memory"           # 跨 session key-value 长期记忆 — 用户的人 / 偏好 / 项目 state
     - "kinbrain"         # 跨 session + 跨 agent 的累积知识库 — recall 蜂群 6 月写的 1,500+ 分析 + 230MB 语料 (output / knowledge / input / notes 四 root grep);save 新洞察到 ~/.kinbrain/notes/。每次新任务前先 recall("…") 看蜂群 / Jacky 有没有写过 — 比 memory 大几个量级
-    - "kinbrowser"       # ★ 2026-05-20 替代以下 5 个 web 爪 ★ Markdown-native browser. 3 层 escalation: HTTP+readability+html→md (~100ms, 80% 站点) → Lightpanda CDP (~500ms) → chromedp 全 Chrome (~2s). 永远输出 markdown 给 LLM 直接读 (省 5-10× tokens vs HTML). action=open 读 + 不存,action=archive 存到 KinBrain ~/.kinbrain/notes/web/ (opt-in,只存 paper/doc/权威源,普通浏览不存避免污染 KinBrain). 替代 web_fetch/web_search/web/browser_session/web_scrape
-    # 历史 web 爪保留但 不 enable —— 1 个 kinbrowser 替代下面 5 个:
-    # - "web_fetch"      # 已被 kinbrowser open 覆盖
-    # - "web_search"     # 已被 kinbrowser + LLM 自己 grep 结果覆盖
-    # - "web"            # 已被 kinbrowser Layer 3 (chromedp) 覆盖
-    # - "web_scrape"     # 已被 kinbrowser fallback 覆盖
-    # - "browser_session" # 多步交互场景留待 v0.2 加 kinbrowser session 支持
+    # ── Web 入口：6 个工具并存，LLM 按任务选 ── (2026-05-20 演化:
+    #  早上"1 替代 5"过激，下午撞 CNN/weather.com/Google 后撤回。
+    #  每个工具有自己的真护城河，LLM 自己挑契合任务的那个。)
+    - "kinbrowser"       # 默认 content URL → markdown. 3 层 escalation
+                         # (HTTP+readability ~100ms → Lightpanda → chromedp).
+                         # PDF auto-detect (poppler). action=open 读不存,
+                         # action=archive 存到 KinBrain (高信号才存).
+                         # 适合: 论文/blog/文档/README/news article/任何"读这个 URL"
+    - "web_search"       # DDG / SearXNG 搜索. query → 标题+URL+snippet 列表.
+                         # 适合: "查 X 信息" (LLM 先 web_search 拿 URLs,
+                         # 再用 kinbrowser 抓每条). 别拿 kinbrowser 喂 search URL!
+    - "web_fetch"        # 简单 HTTP GET. 不走 readability/不转 markdown.
+                         # 适合: JSON API / 原始 HTML / 你明确不要预处理
+    - "web"              # Playwright 万能爪. 多步: click+wait+type+extract+screenshot.
+                         # 适合: "登录页 → 点搜 → 等结果 → 提数据" 这种链
+    - "web_scrape"       # Scrapling 反爬专家. TLS 指纹/Cloudflare/Akamai/DataDome.
+                         # 适合: kinbrowser 全 3 层都撞 bot 墙 (Cloudflare/Google),
+                         # 或目标本来就有强反爬 (LinkedIn/Instagram public)
+    - "browser_session"  # browser-use super-skill. 多步 + 持久 session.
+                         # 适合: 登录态需要跨多页保持 (银行/Notion/SaaS dashboard)
     - "location"         # 实时 GPS via corelocationcli
     - "spawn"            # 派子 agent (researcher 查信息 / eye 看图 / critic 审产物)
     - "todo_write"       # 多步任务 plan,KinClaw Mac 渲染成可见 checklist
