@@ -128,7 +128,15 @@ func (s *kinbrainSkill) recall(query string) (string, error) {
 	}
 	// kinbrain prints matches to stdout (per-root sections + paths)
 	// and "N total" to stderr. We want both.
-	cmd := exec.Command("kinbrain", "recall", query)
+	//
+	// --limit 50: cap per-root path output to keep tool-result payload
+	// LLM-context-friendly. A query for "2026-05-19" on Jacky's corpus
+	// returns 1,014 matches across roots — printing all of them blows
+	// past KinClaw's tool-result size budget and the result gets
+	// flagged "error". 50 paths per root is plenty for the LLM to pick
+	// from; if it needs more, it should narrow the query (and the
+	// truncation hint tells it so).
+	cmd := exec.Command("kinbrain", "recall", "--limit", "50", "--", query)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {

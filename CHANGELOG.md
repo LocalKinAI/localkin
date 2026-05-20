@@ -1,5 +1,53 @@
 # Changelog
 
+## [Unreleased] - 2026-05-17 — kinbrain skill: pass `--limit 50` to keep tool-result payloads sane
+
+### Bug observed in the wild
+
+Pilot soul asked the LLM "今天蜂群有没有产出新的论文". The LLM called
+`kinbrain.recall(...)` with a query that matched **1,014 files** in
+the output root. The full path list was ~80 KB; KinClaw's tool-result
+pipeline saw the oversized result and flagged it `error` (red dot in
+the UI). LLM correctly recovered by falling back to `shell` (find) +
+`file_read` to get the same answer — multi-tool resilience working as
+designed — but the kinbrain path itself should have just worked.
+
+### Fix
+
+The kinbrain CLI grew a `--limit N` flag (sibling commit on
+localkin-core). This skill now always passes `--limit 50` so the
+tool-result stays under ~5 KB even on a 1,000+ hit query:
+
+```go
+cmd := exec.Command("kinbrain", "recall", "--limit", "50", "--", query)
+```
+
+The `--` separator prevents queries starting with `-` from being
+interpreted as flags. The truncation hint kinbrain prints
+(`... and 964 more, narrow your query`) tells the LLM there's more
+behind the curtain.
+
+### Files
+
+    pkg/skill/kinbrain.go      MOD  exec line: add --limit 50 + -- separator
+    CHANGELOG.md               MOD  this entry
+
+### Test
+
+    go test ./pkg/skill -run TestKinBrain   5/5 pass
+    end-to-end smoke (skill.Execute with broad query) returned 53
+    lines max regardless of how many files matched
+
+### Lesson, redux
+
+Today's third kinbrain UX issue, same root cause: I designed kinbrain
+for **CLI ergonomics** (default = give me everything), but the LLM
+consumer needs **bounded payloads** (default = give me a useful
+sample, hint if truncated). Two consumers, two defaults. The CLI flag
++ skill-side hardcode is the cleanest separation.
+
+---
+
 ## [Unreleased] - 2026-05-17 — kinbrain: teach LLM grep semantics (anti-search-engine UX)
 
 ### Bug observed in the wild
