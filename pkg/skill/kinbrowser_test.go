@@ -2,6 +2,7 @@ package skill
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -59,6 +60,61 @@ func TestKinBrowserSkill_MissingBinary(t *testing.T) {
 	if !strings.Contains(err.Error(), "go install") {
 		t.Errorf("error should include install command, got: %v", err)
 	}
+}
+
+// TestKinBrowserSkill_FetchFailureReturnsContent — the key fix from
+// the California-fire incident. When kinbrowser CLI exits non-zero on
+// a URL fetch (timeout, 404, paywall, etc.), the skill MUST return
+// markdown content explaining the failure, NOT a Go error — otherwise
+// KinClaw's circuit breaker counts it as a skill failure and blocks
+// the whole task after 3 unrelated URL failures.
+//
+// We simulate this by pointing the skill at a /usr/bin/false that
+// exits 1 (substituting for kinbrowser); the test verifies the skill
+// gracefully returns content, not error.
+func TestKinBrowserSkill_FetchFailureReturnsContent(t *testing.T) {
+	// Build a tiny shim binary that mimics kinbrowser by exiting 1
+	// with a plausible error message on stderr.
+	shimDir := t.TempDir()
+	shim := shimDir + "/kinbrowser"
+	if err := writeShim(shim); err != nil {
+		t.Fatal(err)
+	}
+
+	// Put the shim first on PATH so exec.LookPath finds it.
+	t.Setenv("PATH", shimDir+":"+os.Getenv("PATH"))
+
+	s := NewKinBrowserSkill()
+	out, err := s.Execute(map[string]string{
+		"action": "open",
+		"url":    "https://example.invalid/some-url",
+	})
+
+	if err != nil {
+		t.Fatalf("expected nil error (fetch failure → content), got: %v", err)
+	}
+	for _, want := range []string{
+		"Fetch failed",
+		"example.invalid",
+		"PER-URL failure",
+		"Try a different URL",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("content should contain %q; got:\n%s", want, out)
+		}
+	}
+}
+
+// writeShim creates a tiny executable that exits 1 with a fake
+// kinbrowser error message on stderr. Cross-platform-ish — on macOS/
+// Linux we use /bin/sh; Windows we'd need a .bat but the tests don't
+// run there.
+func writeShim(path string) error {
+	script := "#!/bin/sh\necho 'kinbrowser: all backends failed; chromedp last error: net/http: timeout' >&2\nexit 1\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		return err
+	}
+	return nil
 }
 
 func TestKinBrowserSkill_ValidationOrder(t *testing.T) {

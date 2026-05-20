@@ -95,6 +95,21 @@ func (s *kinbrowserSkill) Execute(params map[string]string) (string, error) {
 		return "", errors.New("kinbrowser: 'url' is required")
 	}
 
+	// SKILL-LEVEL ERROR vs URL-LEVEL ERROR distinction.
+	//
+	// We return a Go error ONLY when the skill itself is broken
+	// (kinbrowser binary missing, bad params). When kinbrowser runs
+	// but THIS URL fails (timeout, 404, JS-required, Cloudflare
+	// block), we return readable MARKDOWN explaining what happened.
+	//
+	// Why: KinClaw's circuit breaker counts "skill failed N times" —
+	// it's meant to catch broken skills, not "this URL didn't work,
+	// try another". Treating per-URL failures as skill errors trips
+	// the breaker after 3 unrelated URL failures and blocks the
+	// whole task even though kinbrowser is fine.
+	//
+	// Returning markdown content lets the LLM read "FAILED because X,
+	// try Y" and make a decision (different URL, web_search, etc.).
 	if _, err := exec.LookPath("kinbrowser"); err != nil {
 		return "", errors.New(
 			"kinbrowser CLI not found on PATH. Install:\n" +
@@ -103,18 +118,41 @@ func (s *kinbrowserSkill) Execute(params map[string]string) (string, error) {
 	}
 
 	// --quiet so the LLM doesn't see the "[kinbrowser] L1 http | ..."
-	// stderr decoration line on every call (we surface fetch metadata
-	// inside the markdown header instead, or just trust the caller).
+	// stderr decoration line on every call.
 	cmd := exec.Command("kinbrowser", action, "--quiet", "--", url)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("kinbrowser %s: %w\n%s", action, err, stderr.String())
+	err := cmd.Run()
+
+	// Fetch-level failure → return as readable markdown, NOT a Go
+	// error. The LLM gets "this URL failed: <reason>" and can
+	// proceed to try a different URL on its own.
+	if err != nil {
+		reason := strings.TrimSpace(stderr.String())
+		if reason == "" {
+			reason = err.Error()
+		}
+		// Strip the "kinbrowser: " prefix die() adds; we re-add our
+		// own header in the markdown.
+		reason = strings.TrimPrefix(reason, "kinbrowser: ")
+		return fmt.Sprintf(
+			"# Fetch failed\n\n"+
+				"**URL**: %s\n"+
+				"**Reason**: %s\n\n"+
+				"This is a PER-URL failure, not a kinbrowser problem. "+
+				"Suggestions for the agent:\n"+
+				"- Try a different URL from your search results\n"+
+				"- The URL may be behind a paywall, geofence, or anti-bot challenge\n"+
+				"- If you have web_search available, try a different query / source\n"+
+				"- If 4-5 URLs all fail, then it might be a network issue worth surfacing to the user\n",
+			url, reason), nil
 	}
 
 	out := stdout.String()
 	if strings.TrimSpace(out) == "" {
-		return "(kinbrowser returned empty content for " + url + ")", nil
+		return "# Empty content\n\n**URL**: " + url + "\n\nkinbrowser returned no extractable content. " +
+			"The page may have been image-only, behind a paywall, or had no main text. " +
+			"Try a different source.", nil
 	}
 	return out, nil
 }

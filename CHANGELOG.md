@@ -1,5 +1,77 @@
 # Changelog
 
+## [Unreleased] - 2026-05-20 — `kinbrowser` skill: fetch failures return content, not Go error
+
+### Bug observed in the wild
+
+Pilot soul asked "看看加州大火" (California wildfires). LLM:
+
+1. Searched, got URLs from CalFire / news sites
+2. Called `kinbrowser open` on ~5 URLs
+3. ~3 succeeded (got real markdown), ~2 failed (paywall/timeout/anti-bot)
+4. Failures returned Go errors → KinClaw circuit breaker fired after
+   3 failures across the session:
+
+   > [SYSTEM] Skill "kinbrowser" has failed 3 times in this session.
+   > STOP retrying THIS specific skill — but the task is NOT over.
+
+5. Task blocked. LLM gave up.
+
+The 3 failures were unrelated URL fetches — NOT kinbrowser being
+broken. But the skill returned Go errors for all of them,
+indistinguishable from "this skill is fundamentally not working".
+The circuit breaker correctly fired given the signals it had; the
+signals were just wrong.
+
+### Fix
+
+Distinguish **skill-level failures** from **URL-level failures**:
+
+| Failure type | Return | Triggers circuit breaker? |
+|---|---|---|
+| kinbrowser binary missing | Go `error` | yes (legitimately broken) |
+| Bad params (no action / no url) | Go `error` | yes |
+| URL fetch failed (404/timeout/paywall) | **Markdown content** | **no** |
+| Empty content returned | **Markdown content** | **no** |
+
+When kinbrowser CLI exits non-zero on a URL, the skill now returns:
+
+```
+# Fetch failed
+
+**URL**: https://example.com/some-page
+**Reason**: all backends failed; chromedp last error: context deadline exceeded
+
+This is a PER-URL failure, not a kinbrowser problem. Suggestions for the agent:
+- Try a different URL from your search results
+- The URL may be behind a paywall, geofence, or anti-bot challenge
+- If you have web_search available, try a different query / source
+- If 4-5 URLs all fail, then it might be a network issue worth surfacing to the user
+```
+
+LLM reads this, picks another URL, no breaker tripped. The circuit
+breaker now only fires when the skill itself is broken — which is what
+it's meant to detect.
+
+### Files
+
+    pkg/skill/kinbrowser.go             MOD  return content on exec failure
+    pkg/skill/kinbrowser_test.go        MOD  +TestKinBrowserSkill_FetchFailureReturnsContent
+    CHANGELOG.md                        MOD  this entry
+
+### Tests
+
+    go test ./pkg/skill -run TestKinBrowser   5/5 pass (was 4/4)
+
+### Lesson
+
+> KinClaw's circuit breaker is meant for "this tool is broken" — not
+> "this tool's input didn't work". Don't conflate them: per-call
+> failures should be data the LLM consumes; only protocol-level
+> failures should bubble up as errors.
+
+---
+
 ## [Unreleased] - 2026-05-20 — `kinbrowser` skill: markdown-native browser, replaces 5 web skills
 
 ### Why
