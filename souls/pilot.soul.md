@@ -4,7 +4,7 @@ version: "0.3.0"
 
 brain:
   provider: "ollama"
-  model: "kimi-k2.5:cloud"
+  model: "kimi-k2.6:cloud"
   temperature: 0.3
   context_length: 131072
 
