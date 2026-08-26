@@ -12,10 +12,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/LocalKinAI/kinclaw/pkg/applifecycle"
 	"github.com/LocalKinAI/kinclaw/pkg/auth"
 	"github.com/LocalKinAI/kinclaw/pkg/brain"
+	"github.com/LocalKinAI/kinclaw/pkg/mcp"
 	"github.com/LocalKinAI/kinclaw/pkg/memory"
 	"github.com/LocalKinAI/kinclaw/pkg/skill"
 	"github.com/LocalKinAI/kinclaw/pkg/soul"
@@ -42,6 +44,17 @@ type session struct {
 	history  []brain.Message
 	debug    bool
 	soulPath string
+
+	// Live MCP server subprocesses backing the registry's mcp_* skills.
+	// Held on the session because buildRegistry runs again on every soul
+	// reload: without closing the previous set first, each reload would
+	// leave a full set of orphaned server processes behind.
+	mcpClients []*mcp.Client
+	// Load outcomes and the config they came from, kept so GET /api/mcp can
+	// report what the settings UI needs: not just which servers are running,
+	// but which were configured and failed — the state worth surfacing.
+	mcpResults []mcp.LoadResult
+	mcpConfig  *mcp.Config
 
 	// Pending detached-spawn results, drained at the start of the next
 	// turn and prepended to messages as synthetic user messages so the
@@ -146,7 +159,7 @@ Subcommand help: kinclaw serve -h  /  kinclaw harvest -h  /  kinclaw probe -h
 		os.Exit(1)
 	}
 
-	sess, err := newSession(path, *debug)
+	sess, err := newSession(path, *debug, *execMsg != "")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -154,6 +167,8 @@ Subcommand help: kinclaw serve -h  /  kinclaw harvest -h  /  kinclaw probe -h
 	if sess.store != nil {
 		defer sess.store.Close()
 	}
+	// MCP servers are subprocesses; they don't die with us unless told to.
+	defer sess.closeMCP()
 
 	fmt.Fprintf(os.Stderr, "\033[2m  LocalKin %s\n  Soul:     %s (%s)\n  Brain:    %s / %s\n  Skills:   %d loaded\033[0m\n\n",
 		version, sess.soul.Meta.Name, sess.soul.FilePath,
@@ -167,7 +182,7 @@ Subcommand help: kinclaw serve -h  /  kinclaw harvest -h  /  kinclaw probe -h
 	runREPL(sess)
 }
 
-func newSession(soulPath string, debug bool) (*session, error) {
+func newSession(soulPath string, debug bool, ephemeral bool) (*session, error) {
 	s, err := soul.LoadSoul(soulPath)
 	if err != nil {
 		return nil, err
@@ -226,7 +241,7 @@ func newSession(soulPath string, debug bool) (*session, error) {
 		}
 	}
 
-	reg := buildRegistry(s, store)
+	reg, mcpClients, mcpResults, mcpConfig := buildRegistry(s, store)
 
 	// session_id used to be "<soul-name>-<pid>" — every kinclaw process
 	// got its own bucket, so restarting kinclaw = empty history. That
@@ -245,7 +260,28 @@ func newSession(soulPath string, debug bool) (*session, error) {
 	// every new message lands in the clean key.
 	sessionID := s.Meta.Name
 	var history []brain.Message
-	if store != nil {
+
+	// One-shot runs get their own session and start with no history.
+	//
+	// The shared per-soul key is right for the REPL, where continuing a
+	// conversation across restarts is the point. It is wrong for -exec, which
+	// is documented as "execute a single message and exit" and is how every
+	// programmatic caller drives kinclaw: spawn, harvest's curator, harvest's
+	// coder. Those fire the same soul hundreds of times against unrelated
+	// inputs, and under one key each run inherited every previous one.
+	//
+	// Measured on this machine before the fix: the curator session held 812
+	// messages and macbench 11,579. Triaging 161 harvest candidates, the
+	// curator was judging candidate N with candidates 1..N-1 still in context,
+	// and its verdicts bled — it described `songwriting-and-ai-music` as
+	// wrapping FindMy.app, and `maps` as wrapping the HuggingFace CLI. Both
+	// were verbatim descriptions of earlier candidates.
+	//
+	// Still written to the store, under a unique key, so a one-shot run
+	// remains recallable; it just no longer contaminates the next one.
+	if ephemeral {
+		sessionID = fmt.Sprintf("%s#once-%d-%d", s.Meta.Name, os.Getpid(), time.Now().UnixNano())
+	} else if store != nil {
 		// 50 messages is the same volume as before — just spans
 		// multiple kinclaw runs now instead of one. Each row's
 		// content is capped client-side via LoadHistory's truncation
@@ -255,13 +291,14 @@ func newSession(soulPath string, debug bool) (*session, error) {
 
 	return &session{
 		soul: s, brain: b, registry: reg,
-		toolDefs: reg.FilteredToolDefs(s.Meta.Skills.Enable),
-		store: store, id: sessionID, history: history,
+		toolDefs: reg.FilteredToolDefs(effectiveEnable(s)),
+		store:    store, id: sessionID, history: history,
 		debug: debug, soulPath: soulPath,
+		mcpClients: mcpClients, mcpResults: mcpResults, mcpConfig: mcpConfig,
 	}, nil
 }
 
-func buildRegistry(s *soul.Soul, store *memory.SQLiteStore) *skill.Registry {
+func buildRegistry(s *soul.Soul, store *memory.SQLiteStore) (*skill.Registry, []*mcp.Client, []mcp.LoadResult, *mcp.Config) {
 	reg := skill.NewRegistry()
 	skillsDir := "./skills"
 	if s.Meta.Skills.Dir != "" {
@@ -353,6 +390,21 @@ func buildRegistry(s *soul.Soul, store *memory.SQLiteStore) *skill.Registry {
 				len(exts), dir, strings.Join(names, ", "))
 		}
 	}
+	// MCP servers from ~/.localkin/mcp.json, registered as ordinary
+	// skills. Same format Claude Desktop and kincode use, so an existing
+	// config can be copied over and a server's published install snippet
+	// pasted in unchanged.
+	//
+	// Registered here — after external skills, before the allowlist
+	// summary — so MCP tools appear in the same "registered vs enabled"
+	// accounting as everything else. They are subject to the soul's
+	// enable list like any other skill; nothing reaches the model just
+	// because a server was configured.
+	// Returned rather than closed here: these are subprocesses that must
+	// outlive this function and stay up for as long as the registry does.
+	// The caller owns them.
+	mcpClients, mcpResults, mcpConfig := loadMCPServers(reg)
+
 	// Final list of skills the model will actually see, after the
 	// soul's `skills.enable` allowlist filter. Catches the common
 	// "I loaded N skills but pilot says it has no <X>" surprise:
@@ -360,7 +412,7 @@ func buildRegistry(s *soul.Soul, store *memory.SQLiteStore) *skill.Registry {
 	// list, so the model never sees it. Listing both is one
 	// glance to spot the gap.
 	allRegistered := reg.AllNames()
-	enabled := s.Meta.Skills.Enable
+	enabled := effectiveEnable(s)
 	if len(enabled) > 0 {
 		fmt.Fprintf(os.Stderr,
 			"[skills] %d registered total; soul enables %d → exposed to model: %s\n",
@@ -378,23 +430,25 @@ func buildRegistry(s *soul.Soul, store *memory.SQLiteStore) *skill.Registry {
 			"[skills] %d registered, soul has empty enable → ALL exposed to model\n",
 			len(allRegistered))
 	}
-	return reg
+	return reg, mcpClients, mcpResults, mcpConfig
 }
 
 // intersect returns the elements of `want` that exist in `have`,
 // preserving the order of `want`. Used to print the actual list
 // of tools the model will see (registry ∩ soul.skills.enable).
+// intersect lists the registered skills the soul's enable list actually
+// admits. It resolves wildcards through skill.MatchesAllow so this summary
+// matches FilteredToolDefs — reporting the literal string "mcp_github_*" as
+// exposed, or omitting the tools it admits, would make the log lie about
+// what the model can see.
 func intersect(have, want []string) []string {
-	set := make(map[string]bool, len(have))
-	for _, h := range have {
-		set[h] = true
-	}
 	out := make([]string, 0, len(want))
-	for _, w := range want {
-		if set[w] {
-			out = append(out, w)
+	for _, h := range have {
+		if skill.MatchesAllow(want, h) {
+			out = append(out, h)
 		}
 	}
+	sort.Strings(out)
 	return out
 }
 
@@ -402,14 +456,22 @@ func intersect(have, want []string) []string {
 // have no matching registered skill. Surfaces typos / gone-stale
 // references so the user can spot "soul says enable: ['locaton']
 // but skill is named 'location'" in 1 second instead of 1 hour.
+// missingFromEnabled lists enable entries that match nothing registered —
+// usually a typo, or a skill that failed to load. A wildcard counts as
+// matched if any registered skill has that prefix; reporting `mcp_github_*`
+// as missing whenever that server happens to be down would train the user to
+// ignore this warning.
 func missingFromEnabled(enabled, registered []string) []string {
-	set := make(map[string]bool, len(registered))
-	for _, r := range registered {
-		set[r] = true
-	}
 	var out []string
 	for _, e := range enabled {
-		if !set[e] {
+		matched := false
+		for _, r := range registered {
+			if skill.MatchesAllow([]string{e}, r) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
 			out = append(out, e)
 		}
 	}
@@ -539,7 +601,7 @@ func handleUserMessage(ctx context.Context, sess *session, input string) {
 		if msg.Role == brain.RoleAssistant {
 			for _, tc := range msg.ToolCalls {
 				if tc.Function.Name == "forge" {
-					sess.toolDefs = sess.registry.FilteredToolDefs(sess.soul.Meta.Skills.Enable)
+					sess.toolDefs = sess.registry.FilteredToolDefs(effectiveEnable(sess.soul))
 					return
 				}
 			}
@@ -636,9 +698,10 @@ func chatLoop(ctx context.Context, sess *session, messages []brain.Message, onCh
 // Returns ("", false) if no match, the script is missing, or it errored.
 //
 // The router's exit code semantics:
-//   0  → match + executed (KINTHINK_EXEC=1)
-//   10 → no-match (caller falls back to LLM)
-//   other → script error (treated like no-match for safety)
+//
+//	0  → match + executed (KINTHINK_EXEC=1)
+//	10 → no-match (caller falls back to LLM)
+//	other → script error (treated like no-match for safety)
 func tryGrepRoute(sess *session, prompt string) (string, bool) {
 	script := sess.soul.Meta.Cerebellum.GrepRouteScript
 	if script == "" {
@@ -780,8 +843,8 @@ func handleCommand(ctx context.Context, sess *session, input string) bool {
 		}
 		sess.soul = s
 		sess.id = s.Meta.Name // keep in sync — soul rename would otherwise misroute saves
-		sess.registry = buildRegistry(s, sess.store)
-		sess.toolDefs = sess.registry.FilteredToolDefs(s.Meta.Skills.Enable)
+		sess.swapRegistry(buildRegistry(s, sess.store))
+		sess.toolDefs = sess.registry.FilteredToolDefs(effectiveEnable(s))
 		fmt.Printf("\033[2mReloaded %s (%d skills)\033[0m\n", s.Meta.Name, len(sess.toolDefs))
 
 	case "/soul":
@@ -801,8 +864,8 @@ func handleCommand(ctx context.Context, sess *session, input string) bool {
 			sess.soul = s
 			sess.soulPath = path
 			sess.id = s.Meta.Name // route saves under the new soul's bucket
-			sess.registry = buildRegistry(s, sess.store)
-			sess.toolDefs = sess.registry.FilteredToolDefs(s.Meta.Skills.Enable)
+			sess.swapRegistry(buildRegistry(s, sess.store))
+			sess.toolDefs = sess.registry.FilteredToolDefs(effectiveEnable(s))
 			// Load the new soul's prior history — switching is opting
 			// into that soul's accumulated memory, not starting fresh.
 			// /reset is the path for "wipe and start over."
@@ -889,18 +952,18 @@ func homeSkillsDir() string {
 // dirs override earlier ones (Registry's `r.skills[name] = s`
 // last-write-wins).
 //
-//	1. Extra dirs from $KINCLAW_SKILL_DIRS env var (colon-separated).
-//	   Set by KinClaw Mac's Makefile to point at the dev repo's
-//	   skills/, so a user who pulled kinclaw-mac and ran `make run`
-//	   gets all built-in skills without a copy step.
-//	2. Extra dirs from ~/.localkin/skill-sources.txt (one path per
-//	   line, # comments, blank lines OK). Persistent equivalent of
-//	   the env var — written by install.sh or set by the user.
-//	3. ~/.localkin/skills/ — family-shared user customizations,
-//	   survives reinstalls.
-//	4. The skill dir from the soul's frontmatter (or "./skills"
-//	   default) — repo-local, so `cd dev-repo && kinclaw serve`
-//	   picks up source-tree skills automatically.
+//  1. Extra dirs from $KINCLAW_SKILL_DIRS env var (colon-separated).
+//     Set by KinClaw Mac's Makefile to point at the dev repo's
+//     skills/, so a user who pulled kinclaw-mac and ran `make run`
+//     gets all built-in skills without a copy step.
+//  2. Extra dirs from ~/.localkin/skill-sources.txt (one path per
+//     line, # comments, blank lines OK). Persistent equivalent of
+//     the env var — written by install.sh or set by the user.
+//  3. ~/.localkin/skills/ — family-shared user customizations,
+//     survives reinstalls.
+//  4. The skill dir from the soul's frontmatter (or "./skills"
+//     default) — repo-local, so `cd dev-repo && kinclaw serve`
+//     picks up source-tree skills automatically.
 //
 // Missing dirs are skipped silently. Duplicate paths across sources
 // are deduped so we don't load the same dir twice.
@@ -956,7 +1019,9 @@ func loadOAuthToken() string {
 	if err != nil {
 		return ""
 	}
-	var a struct{ AccessToken string `json:"access_token"` }
+	var a struct {
+		AccessToken string `json:"access_token"`
+	}
 	if json.Unmarshal(data, &a) != nil {
 		return ""
 	}
@@ -1035,4 +1100,80 @@ func runCleanup(preexisting []string) {
 		fmt.Fprintf(os.Stderr, "\033[2m  Cleanup: %d app(s) refused to quit (unsaved work or AE timeout): %s\033[0m\n",
 			len(failed), strings.Join(failed, ", "))
 	}
+}
+
+// loadMCPServers connects the MCP servers listed in ~/.localkin/mcp.json and
+// registers their tools. Returns the live clients so main can close them.
+//
+// Every outcome is logged, including the boring ones. An MCP server that
+// fails to start is invisible otherwise — the agent simply lacks tools it
+// was supposed to have, with nothing to distinguish that from the server
+// never having been configured. The log line is the only place that
+// difference shows up until there's a settings UI.
+func loadMCPServers(reg *skill.Registry) ([]*mcp.Client, []mcp.LoadResult, *mcp.Config) {
+	path := mcp.DefaultConfigPath()
+	if path == "" {
+		return nil, nil, nil
+	}
+
+	cfg, err := mcp.LoadConfig(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[mcp] %v\n", err)
+		return nil, nil, nil
+	}
+	if len(cfg.MCPServers) == 0 {
+		return nil, nil, cfg
+	}
+
+	clients, results := mcp.Connect(cfg, reg)
+	for _, r := range results {
+		switch {
+		case r.Err != nil:
+			fmt.Fprintf(os.Stderr, "[mcp] ✗ %s: %v\n", r.Name, r.Err)
+		case r.Disabled:
+			fmt.Fprintf(os.Stderr, "[mcp] – %s: disabled\n", r.Name)
+		default:
+			fmt.Fprintf(os.Stderr, "[mcp] ✓ %s: %d tool(s)\n", r.Name, r.ToolCount)
+		}
+	}
+	return clients, results, cfg
+}
+
+// swapRegistry installs a freshly built registry, shutting down the MCP
+// servers the old one was using.
+//
+// Soul reload rebuilds the registry, which reconnects every configured MCP
+// server. The previous subprocesses have no other owner, so without closing
+// them here each reload would strand a full set — invisible until the user
+// notices a pile of node/python processes.
+func (s *session) swapRegistry(reg *skill.Registry, clients []*mcp.Client, results []mcp.LoadResult, cfg *mcp.Config) {
+	for _, c := range s.mcpClients {
+		c.Close()
+	}
+	s.registry = reg
+	s.mcpClients = clients
+	s.mcpResults = results
+	s.mcpConfig = cfg
+}
+
+// closeMCP shuts down all MCP server subprocesses.
+func (s *session) closeMCP() {
+	for _, c := range s.mcpClients {
+		c.Close()
+	}
+	s.mcpClients = nil
+}
+
+// effectiveEnable is a soul's own enable list plus any extras the user added
+// from the settings UI.
+//
+// Read from disk on each call rather than cached: the overlay is edited by a
+// separate process (the Mac app), so a value captured at startup would go
+// stale the moment the user ticks a box.
+func effectiveEnable(s *soul.Soul) []string {
+	if s == nil {
+		return nil
+	}
+	extras := skill.LoadExtras(skill.ExtrasPath())
+	return skill.EffectiveEnable(s.Meta.Skills.Enable, extras.For(s.Meta.Name))
 }

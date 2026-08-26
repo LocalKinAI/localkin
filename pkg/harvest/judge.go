@@ -71,19 +71,31 @@ type JudgeCandidate struct {
 
 // JudgeResult is the structured outcome of one curator call.
 type JudgeResult struct {
-	FullText string         // raw curator output (saved with the staged candidate)
-	Verdict  JudgeVerdict   // yes | maybe | no | unparseable
-	Reason   string         // one-sentence explanation
-	Domain   string         // short tag — apple / git / web / ml / creative / ...
+	FullText string       // raw curator output (saved with the staged candidate)
+	Verdict  JudgeVerdict // yes | maybe | no | unparseable
+	Reason   string       // one-sentence explanation
+	Domain   string       // short tag — apple / git / web / ml / creative / ...
 }
 
 // JudgeVerdict is the four-way decision the harvest pipeline routes on.
 type JudgeVerdict string
 
 const (
-	JudgeYes         JudgeVerdict = "yes"
-	JudgeMaybe       JudgeVerdict = "maybe"
-	JudgeNo          JudgeVerdict = "no"
+	JudgeYes   JudgeVerdict = "yes"
+	JudgeMaybe JudgeVerdict = "maybe"
+	JudgeNo    JudgeVerdict = "no"
+	// JudgeReference is for candidates worth keeping but not worth forging.
+	//
+	// The pipeline used to be binary: forge it into skills/, or throw it away.
+	// That loses a real category — methodology and reference material like
+	// skill-creator, mcp-builder, or a brand-guidelines document. Those are
+	// genuinely not expressible as `command + args`, so "no" is the correct
+	// judgment about forging them, but discarding them throws away the ideas
+	// that made harvest worth running in the first place.
+	//
+	// Reference candidates are archived for reading, never registered as
+	// skills, and never touch the repo.
+	JudgeReference   JudgeVerdict = "reference"
 	JudgeUnparseable JudgeVerdict = "unparseable"
 )
 
@@ -115,6 +127,8 @@ func parseJudgeResponse(body string) *JudgeResult {
 		r.Verdict = JudgeMaybe
 	case "no", "n", "拒绝", "否":
 		r.Verdict = JudgeNo
+	case "reference", "ref", "参考", "存档":
+		r.Verdict = JudgeReference
 	default:
 		r.Verdict = JudgeUnparseable
 	}

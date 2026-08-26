@@ -69,6 +69,7 @@ skills:
     - "learn"            # append cross-session lesson to learned.md (技术性 doctrine)
     - "memory"           # 跨 session key-value 长期记忆 — 用户的人 / 偏好 / 项目 state
     - "kinbrain"         # 跨 session + 跨 agent 的累积知识库 — recall 蜂群 6 月写的 1,500+ 分析 + 230MB 语料 (output / knowledge / input / notes 四 root grep);save 新洞察到 ~/.kinbrain/notes/。每次新任务前先 recall("…") 看蜂群 / Jacky 有没有写过 — 比 memory 大几个量级
+    - "mcp_*"   # MCP servers from ~/.localkin/mcp.json
     # ── Web 入口：6 个工具并存，LLM 按任务选 ── (2026-05-20 演化:
     #  早上"1 替代 5"过激，下午撞 CNN/weather.com/Google 后撤回。
     #  每个工具有自己的真护城河，LLM 自己挑契合任务的那个。)

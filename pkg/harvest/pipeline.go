@@ -33,15 +33,21 @@ import (
 
 // Options configures one harvest pipeline run.
 type Options struct {
-	Home             string         // user home; staging + cache live under here
-	KinclawBin       string         // self-path for spawning curator (and coder at accept-time)
-	CuratorSoulPath  string         // resolved souls/curator.soul.md; empty disables judging
-	SkipJudge        bool           // --no-judge: just count candidates, no curator spawn (cron / cheap mode)
-	Inventory        *SkillInventory // current ./skills/ state, injected into curator prompts
-	DryRun           bool           // --diff: scan + judge but don't write to staging
-	Out              io.Writer      // human-readable progress, default os.Stderr
-	CloneTimeout     time.Duration  // per-source git clone/pull deadline (default 120s)
-	JudgeWorkers     int            // parallel curator spawns (default 8)
+	Home            string          // user home; staging + cache live under here
+	KinclawBin      string          // self-path for spawning curator (and coder at accept-time)
+	CuratorSoulPath string          // resolved souls/curator.soul.md; empty disables judging
+	SkipJudge       bool            // --no-judge: just count candidates, no curator spawn (cron / cheap mode)
+	Inventory       *SkillInventory // current ./skills/ state, injected into curator prompts
+	// Verdicts remembers past decisions so a scheduled run only pays for
+	// candidates it has not seen. nil disables caching entirely.
+	Verdicts *VerdictCache
+	// ReJudge ignores the cache — for when the curator soul or the skill
+	// inventory changed, which makes every past verdict potentially stale.
+	ReJudge      bool
+	DryRun       bool          // --diff: scan + judge but don't write to staging
+	Out          io.Writer     // human-readable progress, default os.Stderr
+	CloneTimeout time.Duration // per-source git clone/pull deadline (default 120s)
+	JudgeWorkers int           // parallel curator spawns (default 8)
 }
 
 // Result is the per-source outcome of a pipeline run.
@@ -51,6 +57,8 @@ type Result struct {
 	Yes        []string // staged with verdict=yes
 	Maybe      []string // staged with verdict=maybe
 	No         []string // dropped — curator said no
+	Reference  []string // archived for reading, not forged
+	Cached     []string // verdict reused from a previous run
 	Pending    []string // candidates we'd judge but couldn't (--no-judge or curator unavailable)
 	Errors     []string // source-level errors (clone / license / glob)
 }
@@ -195,6 +203,32 @@ func processCandidate(
 		return
 	}
 
+	// Reuse a past decision when this exact content was judged before.
+	//
+	// Keyed on content, so an edited skill is re-judged and a renamed one is
+	// not. Cached "no" verdicts matter most: they are the large majority, and
+	// they leave nothing on disk, so nothing else could tell us we had already
+	// looked at them.
+	key := CandidateKey(content)
+	if !opts.ReJudge {
+		if prev, ok := opts.Verdicts.Get(key); ok {
+			mu.Lock()
+			r.Cached = append(r.Cached, cand.Name)
+			switch prev.Verdict {
+			case string(JudgeYes):
+				r.Yes = append(r.Yes, cand.Name)
+			case string(JudgeMaybe):
+				r.Maybe = append(r.Maybe, cand.Name)
+			case string(JudgeReference):
+				r.Reference = append(r.Reference, cand.Name)
+			default:
+				r.No = append(r.No, cand.Name)
+			}
+			mu.Unlock()
+			return
+		}
+	}
+
 	// Judge is the slow path (LLM round-trip, ~10-15s). Outside the
 	// lock so peer workers can also call Judge concurrently.
 	res, err := Judge(ctx, opts.KinclawBin, opts.CuratorSoulPath, opts.Inventory, cand)
@@ -207,6 +241,13 @@ func processCandidate(
 		fmt.Fprintf(out, "   ⚠ %s — judge failed: %v\n", rel, err)
 		return
 	}
+
+	opts.Verdicts.Put(key, VerdictEntry{
+		Verdict: string(res.Verdict),
+		Reason:  res.Reason,
+		Name:    cand.Name,
+		Source:  src.Name,
+	})
 
 	switch res.Verdict {
 	case JudgeYes:
@@ -223,6 +264,20 @@ func processCandidate(
 		if !opts.DryRun {
 			if _, serr := StageJudged(opts.Home, src, cand, string(content), res); serr != nil {
 				r.Errors = append(r.Errors, fmt.Sprintf("%s: stage: %v", rel, serr))
+			}
+		}
+	case JudgeReference:
+		// Archived, never forged. These are the methodology and reference
+		// documents — skill-creator, mcp-builder, brand guidelines — that are
+		// genuinely not expressible as `command + args`, which is why they are
+		// not staged, but whose ideas are the reason for reading an external
+		// skill library at all. Dropping them was the pipeline losing exactly
+		// what it was meant to harvest.
+		r.Reference = append(r.Reference, cand.Name)
+		fmt.Fprintf(out, "   📎 %s — %s\n", cand.Name, res.Reason)
+		if !opts.DryRun {
+			if _, serr := StageReference(opts.Home, src, cand, string(content), res); serr != nil {
+				r.Errors = append(r.Errors, fmt.Sprintf("%s: reference: %v", rel, serr))
 			}
 		}
 	case JudgeNo:

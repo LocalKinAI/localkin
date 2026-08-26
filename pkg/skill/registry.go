@@ -93,19 +93,67 @@ func (r *Registry) FilteredToolDefs(allow []string) []json.RawMessage {
 	if len(allow) == 0 {
 		return r.ToolDefs()
 	}
-	enabled := make(map[string]bool, len(allow))
-	for _, name := range allow {
-		enabled[name] = true
-	}
+	m := newAllowMatcher(allow)
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	var defs []json.RawMessage
 	for _, s := range r.skills {
-		if enabled[s.Name()] {
+		if m.matches(s.Name()) {
 			defs = append(defs, s.ToolDef())
 		}
 	}
 	return defs
+}
+
+// allowMatcher resolves a soul's `skills.enable` list, which is exact names
+// plus optional trailing-`*` prefixes.
+//
+// Wildcards exist for MCP. A server's tool names are chosen by the server and
+// are only knowable after connecting to it, so an exact-match-only allowlist
+// would require the user to launch the agent, read the log to discover the
+// names, then edit the soul — every time a server updates its tool set.
+// `mcp_github_*` says "trust this server", which is the decision the user is
+// actually making when they add it to mcp.json.
+//
+// Prefix-only by design, not full glob. `*` in the middle invites patterns
+// like `*_write` that read as safe but silently widen as new skills land.
+type allowMatcher struct {
+	exact    map[string]bool
+	prefixes []string
+}
+
+func newAllowMatcher(allow []string) allowMatcher {
+	m := allowMatcher{exact: make(map[string]bool, len(allow))}
+	for _, name := range allow {
+		if strings.HasSuffix(name, "*") {
+			m.prefixes = append(m.prefixes, strings.TrimSuffix(name, "*"))
+			continue
+		}
+		m.exact[name] = true
+	}
+	return m
+}
+
+func (m allowMatcher) matches(name string) bool {
+	if m.exact[name] {
+		return true
+	}
+	for _, p := range m.prefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// MatchesAllow reports whether a skill name passes an enable list. Exported
+// so callers that report on the allowlist (startup summaries, settings UI)
+// agree with what FilteredToolDefs actually did.
+func MatchesAllow(allow []string, name string) bool {
+	if len(allow) == 0 {
+		return true
+	}
+	return newAllowMatcher(allow).matches(name)
 }
 
 type ToolCallInfo struct {

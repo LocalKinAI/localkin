@@ -1,0 +1,655 @@
+# KinClaw Auto-Demo Task Pool
+# 30 production-ready tasks for daily auto-recorded demo videos
+# Generated 2026-04-29 — designed for skill `auto_demo` + cron loop
+#
+# Schema per task:
+#   id:                    unique slug (snake_case)
+#   tier:                  1-6 (priority for launch sequencing)
+#   title_zh / title_en:   bilingual titles for upload metadata
+#   narrative_zh / _en:    shot-by-shot description (the actual recording plan)
+#   duration_sec:          target final video length (post-edit)
+#   capability_showcased:  list of KinClaw capabilities the demo highlights
+#   platforms:             upload targets (matches `platforms:` block below)
+#   hook:                  one-line "why this matters" tag for the editor
+#
+# Tier strategy:
+#   Tier 1: Launch week — strongest narrative (5 tasks)
+#   Tier 2: LocalKin recursion (8 tasks)
+#   Tier 3: Productivity / mass audience (5 tasks)
+#   Tier 4: Dev / coder soul (4 tasks)
+#   Tier 5: Christian niche (3 tasks)
+#   Tier 6: Advanced technical depth (5 tasks)
+#
+# Editorial calendar at the bottom of this file plans 4 weeks of daily posts.
+
+version: "1.0"
+generated: "2026-04-29"
+total_tasks: 30
+
+# ─── Generation defaults (auto_demo skill picks these up) ───────────
+defaults:
+  output_dir: "/Users/jackysun/Documents/Workspace/kinclaw/output/demos"
+  resolution: "1920x1080"
+  fps: 30
+  voiceover_engine_zh: "kokoro_zh"
+  voiceover_engine_en: "kokoro_en"
+  caption_subtitle: true
+  thumbnail_auto: true
+  watermark: "© KinClaw · localkin.dev"
+
+# ─── Per-platform upload settings ───────────────────────────────────
+platforms:
+  youtube:
+    enabled: true
+    shorts: false
+    lang: ["zh", "en"]
+  youtube_shorts:
+    enabled: true
+    lang: ["zh", "en"]
+    duration_max: 60
+  twitter:
+    enabled: true
+    lang: ["en", "zh"]
+    duration_max: 140
+  bilibili:
+    enabled: true
+    lang: ["zh"]
+    duration_max: 600
+  douyin:
+    enabled: false               # phase 2
+    lang: ["zh"]
+    duration_max: 60
+  xiaohongshu:
+    enabled: false               # phase 2
+    lang: ["zh"]
+    duration_max: 60
+  hn:
+    enabled: false               # manual review only — never auto-post
+    lang: ["en"]
+  wechat_video:
+    enabled: false               # phase 3 — needs manual login
+    lang: ["zh"]
+  church_groups:
+    enabled: false               # phase 3 — manual share
+    lang: ["zh", "en"]
+
+# ─── Cron loop ──────────────────────────────────────────────────────
+cron:
+  schedule: "0 8 * * *"                  # every day 8am PT
+  pick_strategy: "weighted_by_platform_freshness"
+  fallback_pick: "round_robin_through_tiers"
+  max_per_day: 1                         # never spam — one quality demo / day
+
+# ════════════════════════════════════════════════════════════════════
+# TASKS POOL (30 entries)
+# ════════════════════════════════════════════════════════════════════
+
+tasks:
+
+  # ─── Tier 1 — Launch week (5 strongest narratives) ────────────────
+
+  - id: meta_recursion_seed
+    tier: 1
+    title_zh: "KinClaw 录了这个介绍 KinClaw 的视频"
+    title_en: "KinClaw recorded this video of itself"
+    narrative_zh: |
+      pilot 调度 record + screen + tts 同时跑.
+      Terminal 显示: `kinclaw -soul souls/pilot.soul.md`
+      字幕同步浮现:
+        "It's recording right now."
+        "The video you're watching IS the demo."
+      最后 3 秒: terminal log: `# kinclaw stop record → meta-2026-04-29.mp4`
+    narrative_en: |
+      Same shot list as zh. English voiceover via kokoro_en.
+      Captions in English.
+    duration_sec: 30
+    capability_showcased: [screen, record, tts]
+    platforms: [twitter, youtube_shorts, bilibili]
+    hook: "Meta-recursion — viral seed. Day 1 of any launch."
+
+  - id: vs_operator_native
+    tier: 1
+    title_zh: "OpenAI Operator $200/月 cloud vs KinClaw 17MB 你 Mac 上"
+    title_en: "Operator's 500MB cloud VM vs KinClaw's 17MB native binary, same task"
+    narrative_zh: |
+      Split-screen post-edited via ffmpeg:
+      Left:  Operator running in browser/cloud VM
+      Right: KinClaw locally (sckit-go native screen capture)
+      Same task: 整理 ~/Downloads + 写一封邮件
+      Bottom HUD: completion time, RAM used, $cost
+      KinClaw wins on all 3.
+    narrative_en: same as zh
+    duration_sec: 90
+    capability_showcased: [screen, input, ui]
+    platforms: [twitter, youtube, hn]
+    hook: "Establishes architectural stance vs Anthropic / OpenAI."
+
+  - id: skill_forge_live
+    tier: 1
+    title_zh: "我让 KinClaw 做一件它还不会的事 — 60 秒后它会了"
+    title_en: "I asked KinClaw something it couldn't do. 60 seconds later, it could."
+    narrative_zh: |
+      User input: "把这个 PDF 转成 audiobook"
+      pilot: "I don't have a pdf-to-audio skill"
+      coder soul activates:
+        - drafts SKILL.md
+        - writes Python: pdfplumber → text → kokoro TTS
+        - registers in skill table
+        - kinclaw retries → succeeds
+      Total elapsed: 58 seconds (timestamp on screen).
+    narrative_en: same as zh
+    duration_sec: 90
+    capability_showcased: [skill_forge, coder_soul]
+    platforms: [twitter, youtube, hn, bilibili]
+    hook: "Skill Forge = self-modifying agent. Few have publicly shipped this."
+
+  - id: soul_clone_10x
+    tier: 1
+    title_zh: "10 个 KinClaw clone 同时做 10 件事 — 在你这一台 Mac"
+    title_en: "10 KinClaw clones, 10 different tasks, 1 Mac"
+    narrative_zh: |
+      Spawn 10 clones via pkg/clone.
+      OBS-style grid: 10 tiles, each clone analyzes a different ticker
+      (NVDA / TSLA / AMD / OKLO / MSTR / ARM / SMCI / TSM / GEV / VRT).
+      Each clone independently fetches data, runs analysis, writes report.
+      Total wall time: ~90 sec for 10 (vs ~900 sec sequential).
+    narrative_en: same as zh
+    duration_sec: 60
+    capability_showcased: [soul_clone, sub_agent_dispatch]
+    platforms: [twitter, youtube_shorts, bilibili]
+    hook: "Self-fissioning lobster — visualised."
+
+  - id: 5_models_debate
+    tier: 1
+    title_zh: "Kimi vs Minimax vs DeepSeek vs Claude vs Llama — 同一问题"
+    title_en: "Five labs argue. KinClaw routes the debate."
+    narrative_zh: |
+      Question: "How would you trade off accuracy for speed in a real-time
+      computer-vision pipeline?"
+      Pilot dispatches to 5 specialist souls:
+        - researcher (Kimi K2.6 1T)
+        - eye (Kimi K2.6 multimodal)
+        - critic (Minimax M2.7)
+        - coder (DeepSeek V4 Pro)
+        - llama_specialist (newly forged for this demo)
+      5-pane layout, all responses stream in parallel.
+      Critic soul scores them, picks the most logical answer + explains why.
+    narrative_en: same as zh
+    duration_sec: 90
+    capability_showcased: [multi_lab_routing, critic_soul, soul_dispatch]
+    platforms: [twitter, youtube, hn]
+    hook: "Cross-lab thinking diversity — no one demos this."
+
+  # ─── Tier 2 — LocalKin recursion (KinClaw demos LocalKin) ─────────
+
+  - id: cranmer_eucharist
+    tier: 2
+    title_zh: "KinClaw 跟克兰麦讨论圣餐神学（一边录屏一边谈）"
+    title_en: "KinClaw chats with Cranmer about Eucharist theology"
+    narrative_zh: |
+      Open faith.localkin.ai/cranmer
+      Type: "圣餐礼到底是什么？我应该跪着领吗？"
+      Cranmer's bilingual response streams.
+      KinClaw highlights the grep-verified citations from BCP 1662 + Defence of Sacrament.
+    narrative_en: |
+      Open faith.localkin.ai/cranmer
+      Question: "What is the Eucharist? Should I kneel to receive?"
+      Cranmer responds with grep-verified BCP citations.
+    duration_sec: 60
+    capability_showcased: [web, ui, screen]
+    platforms: [youtube, bilibili, wechat_video, church_groups]
+    hook: "Christian community direct."
+
+  - id: tcm_consultation_demo
+    tier: 2
+    title_zh: "KinClaw 把症状描述给张仲景，看它怎么辨证"
+    title_en: "KinClaw consults Zhang Zhongjing for TCM differential diagnosis"
+    narrative_zh: |
+      User: "最近发烧、怕冷、没有汗"
+      KinClaw routes to heal.localkin.ai/zhang_zhongjing
+      Master walks through 桂枝汤 vs 麻黄汤 differential.
+      Highlights citations from 《伤寒论》原文.
+    narrative_en: same flow with EN voiceover
+    duration_sec: 90
+    capability_showcased: [web, ui, screen, tts]
+    platforms: [bilibili, douyin, xiaohongshu]
+    hook: "Clinic partnership hook + TCM audience."
+
+  - id: selah_arena_5_master_debate
+    tier: 2
+    title_zh: "5 位灵修大师同时辩论一个神学问题"
+    title_en: "5 spiritual masters debate the same question — Selah arena"
+    narrative_zh: |
+      Open faith.localkin.ai/selah/arena
+      Pick 5 masters: Augustine, Calvin, Wesley, Watchman Nee, Cranmer
+      Question: "What is the role of the law for a Christian today?"
+      All 5 stream concurrently in arena 5-pane layout.
+      KinClaw narrates the differences after they finish.
+    narrative_en: same flow
+    duration_sec: 120
+    capability_showcased: [web, ui, screen, tts]
+    platforms: [bilibili, youtube, wechat_video]
+    hook: "Selah arena is a unique LocalKin feature."
+
+  - id: heal_arena_jingfang_vs_wenbing
+    tier: 2
+    title_zh: "经方派 vs 温病派 — 张仲景 vs 叶天士现场辩"
+    title_en: "Cold-damage vs Warm-disease school — Zhang Zhongjing vs Ye Tianshi"
+    narrative_zh: |
+      Open heal.localkin.ai/heal/arena
+      Question: "感冒发烧第3天, 该用经方还是温病方?"
+      Zhang Zhongjing + Ye Tianshi debate. KinClaw narrates.
+      Closes with: 中医 1500 年的争辩, 在 90 秒内呈现.
+    narrative_en: TCM internal debate, EN narration
+    duration_sec: 120
+    capability_showcased: [web, ui, screen, tts]
+    platforms: [bilibili, wechat_video]
+    hook: "TCM internal debate — content depth."
+
+  - id: morning_devotion_5min
+    tier: 2
+    title_zh: "5 分钟早晨灵修流程 — KinClaw 把它做完"
+    title_en: "Five-minute morning devotion routine — automated"
+    narrative_zh: |
+      Open Library → today's recommended audio (e.g. Guyon).
+      Listen 3 min while KinClaw shows the synced verse text.
+      KinClaw transcribes via stt, summarizes the meditation.
+      Saves note to Apple Notes via app_open_clean + ui.
+    narrative_en: same flow
+    duration_sec: 60
+    capability_showcased: [web, screen, stt, ui]
+    platforms: [bilibili, douyin, xiaohongshu, church_groups]
+    hook: "Lifestyle ministry."
+
+  - id: grep_paper_reproduce
+    tier: 2
+    title_zh: "0/5 → 4/4 — KinClaw 跑 grep paper 的复现脚本"
+    title_en: "0/5 → 4/4 — KinClaw runs the grep paper reproducibility script"
+    narrative_zh: |
+      Terminal:
+        git clone github.com/LocalKinAI/grep-is-all-you-need
+        cd grep-is-all-you-need
+        ./reproduce_zero_hallucination.sh
+      Phase 1: 5 fake citations grep-fail (red Xs).
+      Phase 3: 4 real citations grep-pass (green checks).
+      KinClaw narrates each step in voiceover.
+    narrative_en: same script
+    duration_sec: 90
+    capability_showcased: [shell_exec, screen, tts]
+    platforms: [twitter, youtube, hn]
+    hook: "Academic reproducibility demo. Pairs with grep paper DOI."
+
+  - id: discovery_cron_live
+    tier: 2
+    title_zh: "蜂群自己发现 corpus 缺口 + 自动下载补 — 1 周一次"
+    title_en: "The swarm finds its own corpus gaps and auto-fills weekly"
+    narrative_zh: |
+      Manual trigger: python skills/knowledge_compile/discover.py --dry-run
+      Show stderr scanning souls.
+      Display: "0 actionable" (all currently fed).
+      Cut to fake "new soul added" → re-run → finds gap → downloads from
+      Project Gutenberg + Internet Archive.
+      Final shot: cron schedule — runs every Sunday 4am autonomously.
+    narrative_en: same
+    duration_sec: 60
+    capability_showcased: [cron_scheduling, web, shell_exec]
+    platforms: [hn, twitter]
+    hook: "Self-evolving demo — pairs with self_evolving_swarms paper."
+
+  - id: quant_conductor_self_patch
+    tier: 2
+    title_zh: "蜂群凌晨自己改了一个 agent — 我醒来才知道"
+    title_en: "The swarm patched one of its own agents at 2am. I only saw it next morning."
+    narrative_zh: |
+      Show: git log on quant_conductor.soul.md
+      v2.2.5 (4-25) → v2.2.6 (4-26 02:14am)
+      Cut to git diff: stale Chinese citation tag detected and replaced.
+      Author: agent_self_improvement (no human commit).
+      Verification log: post-patch output is compliant.
+    narrative_en: same flow
+    duration_sec: 90
+    capability_showcased: [self_evolving_swarms, git_commit, screen]
+    platforms: [hn, twitter, bilibili]
+    hook: "Headline case study for self_evolving_swarms paper."
+
+  # ─── Tier 3 — Productivity / mass audience ────────────────────────
+
+  - id: inbox_triage
+    tier: 3
+    title_zh: "KinClaw 帮我清 100 封邮件 — 3 分钟"
+    title_en: "KinClaw triages 100 emails in 3 minutes"
+    narrative_zh: |
+      Open Mail.app via app_open_clean.
+      KinClaw uses ui to scan inbox: ~100 unread.
+      Categorizes: trash / archive / reply / important.
+      Drafts 3 replies for the "reply" stack.
+      Final: inbox 100 → 7 in 3 minutes.
+    narrative_en: same
+    duration_sec: 60
+    capability_showcased: [ui, app_open_clean, screen]
+    platforms: [douyin, xiaohongshu, twitter]
+    hook: "Practical AI angle."
+
+  - id: calendar_find_slot
+    tier: 3
+    title_zh: "KinClaw 看 Calendar 找今天能开会的空档"
+    title_en: "KinClaw scans Calendar for today's free slots"
+    narrative_zh: |
+      Voice: "我下午想开 30 分钟会, 哪个 slot 合适?"
+      KinClaw: opens Calendar.app → reads via ui → identifies 14:30-15:00 free.
+      Drafts 1-line confirmation message.
+    narrative_en: same
+    duration_sec: 30
+    capability_showcased: [ui, app_open_clean, stt]
+    platforms: [douyin, xiaohongshu]
+    hook: "Quick utility wow."
+
+  - id: rss_daily_brief
+    tier: 3
+    title_zh: "KinClaw 给我读今早 50 个 RSS 头条"
+    title_en: "KinClaw reads today's RSS headlines aloud"
+    narrative_zh: |
+      Open Reeder/Feedbin via app_open_clean.
+      KinClaw reads top 50 headlines in 30 seconds via tts (sped up).
+      Summarizes in 3 bullet points.
+    narrative_en: same
+    duration_sec: 60
+    capability_showcased: [web, tts, ui]
+    platforms: [bilibili, douyin]
+    hook: "Information overload solver."
+
+  - id: wechat_reply_draft
+    tier: 3
+    title_zh: "KinClaw 帮我起草微信回复"
+    title_en: "KinClaw drafts WeChat replies"
+    narrative_zh: |
+      Open WeChat (web mobile sim).
+      Read pending threads. Summarize each context.
+      Draft replies for the 5 most important.
+      User reviews, swipes through, presses send.
+    narrative_en: localized with WhatsApp / iMessage
+    duration_sec: 30
+    capability_showcased: [web, ui, screen]
+    platforms: [xiaohongshu, douyin, wechat_video]
+    hook: "China mass-market use case."
+
+  - id: auto_git_commit
+    tier: 3
+    title_zh: "KinClaw 看我今天改了什么 + 自动写 commit message"
+    title_en: "KinClaw reads my git diff + writes the commit message"
+    narrative_zh: |
+      Terminal: git diff
+      KinClaw reads, identifies the structural change.
+      Drafts a Conventional Commits style message.
+      Optionally executes git commit.
+    narrative_en: same
+    duration_sec: 30
+    capability_showcased: [shell_exec, git_commit]
+    platforms: [twitter, hn]
+    hook: "Developer niche."
+
+  # ─── Tier 4 — Dev / coder soul ────────────────────────────────────
+
+  - id: skill_60sec
+    tier: 4
+    title_zh: "60 秒写一个 KinClaw skill — KinClaw 自己写"
+    title_en: "60 seconds — KinClaw writes a new KinClaw skill, by itself"
+    narrative_zh: |
+      User: "我想要一个查 latest crypto price 的 skill"
+      coder soul:
+        - drafts SKILL.md
+        - writes Python (CoinGecko API call)
+        - registers skill
+        - hot-reloads → user can call it now
+      All in 60 sec timer on screen.
+    narrative_en: same
+    duration_sec: 60
+    capability_showcased: [skill_forge, coder_soul]
+    platforms: [hn, twitter, youtube]
+    hook: "Skill Forge teaser (lighter weight than skill_forge_live)."
+
+  - id: github_pr_review
+    tier: 4
+    title_zh: "KinClaw 看一个开源 PR 给评论"
+    title_en: "KinClaw reviews an open-source PR + posts a thoughtful comment"
+    narrative_zh: |
+      Browser via web → github.com/<repo>/pull/N
+      KinClaw reads diff, identifies architectural concerns.
+      Drafts a comment with 3 specific feedback points.
+      User reviews, posts.
+    narrative_en: same
+    duration_sec: 90
+    capability_showcased: [web, ui]
+    platforms: [hn, twitter]
+    hook: "Open-source citizen narrative."
+
+  - id: arxiv_paper_summary
+    tier: 4
+    title_zh: "KinClaw 读一篇 arXiv paper + 写 thread"
+    title_en: "KinClaw reads an arXiv paper and writes a Twitter thread"
+    narrative_zh: |
+      User: "看下这篇: arxiv.org/abs/2604.22085"
+      researcher soul opens it, reads, identifies key claims.
+      Drafts a 5-tweet thread with verbatim quotes.
+      User reviews, posts.
+    narrative_en: same
+    duration_sec: 60
+    capability_showcased: [researcher_soul, web]
+    platforms: [twitter]
+    hook: "Pairs with paper_scout cron."
+
+  - id: bug_fix_pr
+    tier: 4
+    title_zh: "KinClaw 自己 fix 一个 bug 自己提 PR"
+    title_en: "KinClaw fixes a bug + opens its own PR"
+    narrative_zh: |
+      User: "github.com/me/myrepo issue #42"
+      KinClaw clones, locates the file, reads context.
+      coder soul makes the minimal fix, writes a test.
+      git_commit, gh pr create.
+      Final: PR link displayed.
+    narrative_en: same
+    duration_sec: 120
+    capability_showcased: [coder_soul, git_commit, web, shell_exec]
+    platforms: [hn, youtube]
+    hook: "Closing the SWE-bench loop."
+
+  # ─── Tier 5 — Christian niche ─────────────────────────────────────
+
+  - id: augustine_grace
+    tier: 5
+    title_zh: "KinClaw 跟奥古斯丁谈恩典与自由意志"
+    title_en: "KinClaw asks Augustine about grace and free will"
+    narrative_zh: |
+      Open faith.localkin.ai/augustine
+      Question: "如果救恩完全靠恩典, 我作的什么 effort 还有意义吗?"
+      Augustine streams response, citing Confessions + On Grace and Free Will.
+    narrative_en: same flow
+    duration_sec: 90
+    capability_showcased: [web, ui]
+    platforms: [bilibili, wechat_video, church_groups, youtube]
+    hook: "Selah Christian audience direct."
+
+  - id: bible_verse_comfort
+    tier: 5
+    title_zh: "朋友难过了 — KinClaw 帮我找一节 Bible verse"
+    title_en: "A friend is grieving — KinClaw finds a Bible verse"
+    narrative_zh: |
+      User: "我朋友刚失去爸爸, 什么经文合适?"
+      KinClaw uses grep over the Selah corpus (with grep paper architecture).
+      Returns: 诗篇 23 + 哥林多后书 1:3-4 + a one-line message.
+      User can copy and send via WeChat / iMessage.
+    narrative_en: same
+    duration_sec: 30
+    capability_showcased: [grep, web]
+    platforms: [xiaohongshu, wechat_video, church_groups]
+    hook: "Real-life ministry use case."
+
+  - id: weekly_sermon_prep
+    tier: 5
+    title_zh: "KinClaw 帮 lay leader 做下周分享准备"
+    title_en: "KinClaw helps a lay leader prep next week's sharing"
+    narrative_zh: |
+      User: "下周分享路加福音 15 章浪子."
+      researcher routes to 5 spiritual masters' commentaries.
+      Pulls quotes from Augustine, Calvin, Spurgeon, Wesley, Watchman Nee.
+      Drafts 1-page outline with attribution.
+    narrative_en: same
+    duration_sec: 120
+    capability_showcased: [web, researcher_soul, screen]
+    platforms: [bilibili, youtube, church_groups]
+    hook: "Service to church workers — distinctive market."
+
+  # ─── Tier 6 — Advanced (technical depth) ──────────────────────────
+
+  - id: cross_lab_critic
+    tier: 6
+    title_zh: "Critic (Minimax) 检查 Pilot (Kimi) 的输出"
+    title_en: "Cross-lab adversarial review: Critic catches Pilot mistakes"
+    narrative_zh: |
+      Pilot generates an analysis.
+      Critic soul (Minimax M2.7) reviews independently.
+      Identifies 2 hallucinations + 1 logical gap.
+      Pilot retries with feedback.
+      Final output is grounded.
+    narrative_en: same
+    duration_sec: 60
+    capability_showcased: [critic_soul, multi_lab_routing]
+    platforms: [hn, twitter]
+    hook: "Cross-lab safety story."
+
+  - id: 5_specialist_concurrent
+    tier: 6
+    title_zh: "5 个 specialist soul 同时跑同一任务的不同 phase"
+    title_en: "5 specialist souls run different phases of one task in parallel"
+    narrative_zh: |
+      Task: "分析 2026 Q1 美股表现 + 生成 1-page report."
+      Pipeline:
+        researcher (data) → fundamentals_analyst (numbers) →
+        sentiment_analyst (news) → bull/bear (debate) → oracle (synthesize)
+      Phases run in parallel where possible. Total wall time ~30 sec.
+    narrative_en: same
+    duration_sec: 90
+    capability_showcased: [soul_dispatch, parallel_exec]
+    platforms: [hn, youtube]
+    hook: "Production swarm orchestration."
+
+  - id: kernel_depth_cap_demo
+    tier: 6
+    title_zh: "KinClaw 想 fork 自己 fork 自己 — kernel 在 depth=2 拦下"
+    title_en: "KinClaw tries to fork itself recursively — kernel stops it at depth 1"
+    narrative_zh: |
+      Pilot tries to spawn a clone that spawns another clone.
+      Kernel intercepts: "Depth limit reached. Sub-agent dispatch capped at 1."
+      Show the safety log + cap config in souls.
+    narrative_en: same
+    duration_sec: 30
+    capability_showcased: [kernel_safety, sub_agent_dispatch]
+    platforms: [hn, twitter]
+    hook: "Safety story — important for trust building."
+
+  - id: voice_screen_ui_combo
+    tier: 6
+    title_zh: "我说一句话 → KinClaw 看屏幕 + 操作 + 报告 — 一气呵成"
+    title_en: "Voice → screen → UI action → spoken report. All in one shot."
+    narrative_zh: |
+      User says: "今天的天气怎样?"
+      Pipeline:
+        stt: voice → text
+        web: 天气查询
+        screen: 截图天气页
+        ui: 解析 element
+        tts: 报告 spoken back to user
+      Zero human intervention between phases.
+    narrative_en: same
+    duration_sec: 60
+    capability_showcased: [stt, web, screen, ui, tts]
+    platforms: [bilibili, youtube, douyin]
+    hook: "5 claws integrated — full sensorimotor loop."
+
+  - id: self_fissioning_speed
+    tier: 6
+    title_zh: "KinClaw 100 个 clone 在 30 秒内 boot — 极致 swarm"
+    title_en: "100 KinClaw clones boot in 30 seconds — peak swarm"
+    narrative_zh: |
+      Show: pkg/clone.SpawnN(100, soul=researcher.soul.md)
+      Real-time grid: 100 small tiles each running a different research query.
+      Total spawn time: 28.4 seconds.
+      Total query completion: 60 seconds.
+      RAM peak: 1.4 GB on Mac mini M2.
+    narrative_en: same
+    duration_sec: 30
+    capability_showcased: [soul_clone, parallel_exec]
+    platforms: [twitter, hn]
+    hook: "Raw speed wow moment."
+
+# ════════════════════════════════════════════════════════════════════
+# EDITORIAL CALENDAR — 4-week launch sequencing
+# ════════════════════════════════════════════════════════════════════
+
+calendar:
+  week_1_launch:
+    description: "All Tier 1 — establish narrative + differentiation"
+    schedule:
+      Mon: meta_recursion_seed
+      Tue: vs_operator_native
+      Wed: skill_forge_live
+      Thu: soul_clone_10x
+      Fri: 5_models_debate
+      Sat: cranmer_eucharist           # Christian launch parallel track
+      Sun: rest
+
+  week_2_localkin_recursion:
+    description: "Tier 2 — show LocalKin via KinClaw recursion"
+    schedule:
+      Mon: tcm_consultation_demo
+      Tue: morning_devotion_5min
+      Wed: grep_paper_reproduce
+      Thu: selah_arena_5_master_debate
+      Fri: discovery_cron_live
+      Sat: quant_conductor_self_patch
+      Sun: rest
+
+  week_3_productivity:
+    description: "Tier 3 + Tier 4 mix — mass audience + dev community"
+    schedule:
+      Mon: inbox_triage
+      Tue: calendar_find_slot
+      Wed: rss_daily_brief
+      Thu: wechat_reply_draft
+      Fri: auto_git_commit
+      Sat: skill_60sec
+      Sun: rest
+
+  week_4_technical_depth:
+    description: "Tier 6 + remaining — show architectural depth, build credibility"
+    schedule:
+      Mon: cross_lab_critic
+      Tue: kernel_depth_cap_demo
+      Wed: voice_screen_ui_combo
+      Thu: 5_specialist_concurrent
+      Fri: self_fissioning_speed
+      Sat: heal_arena_jingfang_vs_wenbing
+      Sun: rest
+
+# ════════════════════════════════════════════════════════════════════
+# EXPLICIT NON-GOALS (do NOT auto-generate)
+# ════════════════════════════════════════════════════════════════════
+exclusions:
+  - id: stock_trading
+    reason: "Legal/compliance risk + ministry-framing mismatch."
+  - id: voice_impersonation
+    reason: "Privacy / impersonation risk."
+  - id: anthropic_trash_talk
+    reason: "Christian witness: differentiate without disparaging."
+  - id: real_patient_data
+    reason: "PHI risk — never auto-record real clinic / medical session."
+
+# ════════════════════════════════════════════════════════════════════
+# AUDITING — track which were posted, which performed
+# ════════════════════════════════════════════════════════════════════
+tracking:
+  posted_log: "/Users/jackysun/Documents/Workspace/kinclaw/output/demos/posted.jsonl"
+  metrics_pull_cron: "0 9 * * *"          # daily 9am pull from each platform
+  retire_threshold: "if 3 platforms < 100 views in 14 days, retire from rotation"
+  rerecord_threshold: "if a task posts > 3 times across same platform, regenerate fresh narrative"

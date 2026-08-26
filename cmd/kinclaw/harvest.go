@@ -77,6 +77,7 @@ Flags:
 	review := fs.Bool("review", false, "List staged candidates and exit")
 	accept := fs.String("accept", "", "Forge a staged candidate into ./skills/ (id: <source>/<skill-name>)")
 	noJudge := fs.Bool("no-judge", false, "Skip the curator triage. Just count candidates per source (cron / cheap mode)")
+	reJudge := fs.Bool("rejudge", false, "Ignore cached verdicts and judge every candidate again. Use after changing the curator soul or adding skills, since both make past decisions stale.")
 	judgeWorkers := fs.Int("judge-workers", 8, "Parallel curator spawns. Higher = faster + more concurrent LLM calls (default 8). Set 1 for sequential.")
 	skillsDir := fs.String("skills-dir", "skills", "--accept destination for forged skills (default ./skills)")
 	libraryDir := fs.String("library-dir", "skills/library", "--accept fallback dir for coder-deferred candidates (default ./skills/library)")
@@ -137,8 +138,19 @@ Flags:
 		fmt.Fprintf(os.Stderr, "current inventory: %d skill(s) at %s\n\n", len(inv.Skills), *skillsDir)
 	}
 
+	// Past verdicts, so a nightly run only pays for what changed. Judging is
+	// the entire cost of a harvest — without this, every run re-derives the
+	// same answers for the same unchanged files.
+	verdicts := harvest.LoadVerdictCache(home)
+	if !*noJudge && verdicts.Len() > 0 {
+		fmt.Fprintf(os.Stderr, "verdict cache: %d prior decision(s)%s\n",
+			verdicts.Len(), map[bool]string{true: " (ignored: --rejudge)"}[*reJudge])
+	}
+
 	opts := harvest.Options{
 		Home:            home,
+		Verdicts:        verdicts,
+		ReJudge:         *reJudge,
 		KinclawBin:      bin,
 		CuratorSoulPath: curatorSoul,
 		SkipJudge:       *noJudge,
@@ -156,6 +168,7 @@ Flags:
 			os.Exit(1)
 		}
 		r := harvest.RunSource(ctx, *src, opts)
+		saveVerdicts(verdicts)
 		printSummary([]harvest.Result{r}, *diff, *noJudge)
 		return
 	}
@@ -164,6 +177,7 @@ Flags:
 	for _, s := range manifest.Sources {
 		results = append(results, harvest.RunSource(ctx, s, opts))
 	}
+	saveVerdicts(verdicts)
 	printSummary(results, *diff, *noJudge)
 }
 
@@ -186,6 +200,10 @@ func runHarvestReview(home string) {
 			mark = "✓"
 		case harvest.JudgeMaybe:
 			mark = "?"
+		case harvest.JudgeReference:
+			// Reference material lives outside staging, so this shouldn't
+			// appear here — render it rather than falling through to "·".
+			mark = "📎"
 		case harvest.JudgeNo:
 			mark = "✗" // shouldn't be in staging, but render gracefully
 		default:
@@ -261,11 +279,14 @@ func printSummary(results []harvest.Result, dryRun, skipJudge bool) {
 	fmt.Fprintln(os.Stderr, "── summary")
 
 	var totalCand, totalYes, totalMaybe, totalNo, totalPending, totalErr int
+	var totalRef, totalCached int
 	for _, r := range results {
 		totalCand += r.Candidates
 		totalYes += len(r.Yes)
 		totalMaybe += len(r.Maybe)
 		totalNo += len(r.No)
+		totalRef += len(r.Reference)
+		totalCached += len(r.Cached)
 		totalPending += len(r.Pending)
 		totalErr += len(r.Errors)
 	}
@@ -277,6 +298,13 @@ func printSummary(results []harvest.Result, dryRun, skipJudge bool) {
 		fmt.Fprintf(os.Stderr, "  ?  %d maybe (staged)\n", totalMaybe)
 	}
 	if totalNo > 0 {
+		if totalRef > 0 {
+			fmt.Fprintf(os.Stderr, "  📎 %d reference (archived at %s)\n",
+				totalRef, harvest.ReferenceRoot(homeDir()))
+		}
+		if totalCached > 0 {
+			fmt.Fprintf(os.Stderr, "  ⚡ %d reused from cache (not re-judged)\n", totalCached)
+		}
 		fmt.Fprintf(os.Stderr, "  ✗  %d no (dropped — curator says not useful)\n", totalNo)
 	}
 	if totalPending > 0 {
@@ -295,5 +323,14 @@ func printSummary(results []harvest.Result, dryRun, skipJudge bool) {
 	if totalYes+totalMaybe > 0 {
 		fmt.Fprintln(os.Stderr, "  Review:        kinclaw harvest --review")
 		fmt.Fprintln(os.Stderr, "  Forge one:     kinclaw harvest --accept <source>/<skill-name>")
+	}
+}
+
+// saveVerdicts persists the decision cache. A failure is reported but not
+// fatal: the scan already happened and its staged output is on disk; losing
+// the cache only costs a re-judge next time.
+func saveVerdicts(v *harvest.VerdictCache) {
+	if err := v.Save(); err != nil {
+		fmt.Fprintf(os.Stderr, "harvest: couldn't save verdict cache: %v\n", err)
 	}
 }

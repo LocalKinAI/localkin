@@ -1,5 +1,121 @@
 # Changelog
 
+## [Unreleased] - 2026-08-26 — MCP servers, harvest that finishes, and a session bug behind both
+
+### Added — Model Context Protocol client
+
+kinclaw can now use tools published by any MCP server, configured in
+`~/.localkin/mcp.json` using the ecosystem-standard `mcpServers` block — the
+same format Claude Desktop and kincode use, so a server's published install
+snippet pastes in unchanged. Verified against the official filesystem server:
+14 tools registered on first try.
+
+The protocol client is a port of kincode's `internal/mcp` rather than a new
+implementation; that one is already in production and carries fixes worth
+inheriting. Four things are new here, each from a specific failure mode:
+
+- **stderr drains to a per-server log** (`~/.localkin/logs/mcp-server-NAME.log`).
+  Draining is mandatory — an unread pipe fills at 64KB and blocks the server
+  mid-response, indistinguishable from a hung tool. Where it goes matters too:
+  the MCP docs say stdio servers may use stderr for *all* logging, so
+  discarding it leaves a failed server with nothing to explain itself.
+- **60s request timeout.** Without it a server that accepts a request and never
+  answers holds the client mutex forever; every later call queues behind it. A
+  CLI can be ctrl-C'd, a menubar app running for days cannot.
+- **Parameter type restoration.** kinclaw hands skills `map[string]string`,
+  while MCP servers validate against their declared schema — a tool wanting
+  `{"type":"integer"}` and receiving `"5"` rejects the call. Values are coerced
+  back using each tool's own schema. Untyped fields are deliberately *not*
+  guessed: treating a bare "01234" as a number would corrupt zip codes and IDs
+  with leading zeros.
+- **Tool names are namespaced** `mcp_<server>_<tool>`. Server tool names come
+  from third parties and collide freely with built-ins (`read`, `run`,
+  `search`); a collision would silently shadow a working skill.
+
+### Added — prefix wildcards in `skills.enable`
+
+A soul can now write `mcp_github_*` to trust a whole server. Exact-match-only
+made MCP unusable: a server's tool names are knowable only after connecting, so
+the user would have to launch, read the log, then edit the soul — every time a
+server updated. Prefix-only by design, not full glob: `*_write` reads as safe
+while silently widening as new skills land.
+
+### Fixed — every `-exec` run shared one session
+
+`sessionID` was the soul's name, which is right for the REPL (continuing a
+conversation across restarts is the point) and wrong for `-exec`, documented as
+"execute a single message and exit" and used by every programmatic caller:
+spawn, harvest's curator, harvest's coder.
+
+Measured before the fix: the curator session held **812 messages**, macbench
+**11,579**. Triaging 161 harvest candidates, the curator judged candidate N
+with candidates 1..N-1 still in context — and its verdicts bled. It described
+`songwriting-and-ai-music` as wrapping FindMy.app and `maps` as wrapping the
+HuggingFace CLI; both were verbatim descriptions of earlier candidates.
+Re-running clean changed the outcome from 15 yes / 134 no to 28 yes / 127 no,
+with `apple-notes` flipping from rejected to accepted.
+
+Demonstrated directly: two separate processes, "remember this word: 紫罗兰" then
+"what word did I ask you to remember" → "紫罗兰". After the fix → "不知道".
+
+One-shot runs now get their own session key and start with no history. They are
+still written to the store, so a run remains recallable; it just no longer
+contaminates the next one.
+
+### Added — verdict cache, so a nightly harvest costs almost nothing
+
+Every run re-judged everything: 161 candidates × ~5s and ~1K input tokens each,
+nightly, to re-derive answers that hadn't changed. Verdicts are now cached by
+**content hash** — a renamed file isn't re-judged, an edited one is. Caching
+"no" verdicts is the point: they are 134 of the 161 and leave nothing on disk,
+so nothing else could tell us we'd already looked at them. `--rejudge` ignores
+the cache, for when the curator soul or skill inventory changed.
+
+### Added — `reference` verdict: keep the idea without forging a skill
+
+The pipeline was binary — forge into `skills/`, or discard. That threw away a
+real category: methodology and reference material (`skill-creator`,
+`mcp-builder`, brand guidelines) which genuinely cannot be expressed as
+`command + args`, so "no" is the right judgment about *forging* them, while
+discarding them loses the ideas that made harvesting worth doing.
+
+Reference candidates are archived to `harvest/reference/` for reading, never
+registered as skills, never forgeable — they live outside `StagedRoot`, so
+`--review` and `--accept` structurally cannot reach them.
+
+The curator soul was taught the new verdict, and its second judging criterion
+changed from "not expressible as exec → no" to "not expressible → does it teach
+something worth borrowing? → reference, else no". Re-judging
+`anthropics-skills`, which had produced **nothing** across 17 candidates: 2 yes,
+**12 reference**, 3 no. Recovered `skill-creator`'s eval methodology,
+`mcp-builder`'s guidance on designing LLM-facing tools, and `xlsx`/`docx`
+task-to-library mappings.
+
+### Fixed — candidate names were used unsanitised as paths
+
+`StageJudged` built directories from `cand.Name`, which comes from frontmatter
+in third-party repositories. A name of `../../../tmp/x` would write outside the
+harvest tree. Names are now reduced to identifier characters; tests cover the
+traversal forms.
+
+### Added — read-only status APIs for the settings UI
+
+`GET /api/mcp`, `/api/harvest`, `/api/skills` report configuration *and* what
+actually happened to it. Config alone can't say whether a server works, and
+"configured but silently failing" is the state that needs showing. `POST
+/api/harvest/accept` runs a forge asynchronously (coder takes up to 4 minutes);
+concurrent accepts of the same candidate return 409 rather than letting two
+agents write one directory.
+
+`POST /api/skills/extras` grants a soul an extra skill **without editing its
+file**. Souls are hand-authored — pilot's enable list is interleaved with
+comments explaining each entry — and a settings toggle that machine-rewrote
+that file would eventually mangle the reasoning to save one text edit. The
+overlay is additive only: removing a soul-granted skill stays an edit to the
+soul, where git can see it.
+
+---
+
 ## [Unreleased] - 2026-05-20 — `kinbrowser` skill: fetch failures return content, not Go error
 
 ### Bug observed in the wild

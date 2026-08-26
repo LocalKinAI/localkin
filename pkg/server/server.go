@@ -120,6 +120,106 @@ type BrainSwitchHandler func(req BrainSwitchRequest) error
 // is in flight (caller-policy via TryLock on turnMu).
 type SessionResetHandler func() error
 
+// MCPServerStatus is one configured MCP server as the settings UI sees it.
+//
+// Config and runtime state are reported together on purpose: a UI that reads
+// mcp.json alone can show what the user asked for but not whether it worked,
+// and "configured but silently failing" is the state that actually needs
+// showing.
+type MCPServerStatus struct {
+	Name      string   `json:"name"`
+	Command   string   `json:"command"`
+	Args      []string `json:"args,omitempty"`
+	Disabled  bool     `json:"disabled"`
+	Connected bool     `json:"connected"`
+	ToolCount int      `json:"toolCount"`
+	Error     string   `json:"error,omitempty"`
+	LogPath   string   `json:"logPath,omitempty"`
+	Tools     []string `json:"tools,omitempty"`
+}
+
+// MCPStatusHandler reports the MCP servers this kernel loaded.
+type MCPStatusHandler func() []MCPServerStatus
+
+// HarvestSource is one configured skill source.
+type HarvestSource struct {
+	Name         string   `json:"name"`
+	URL          string   `json:"url"`
+	SkillPaths   []string `json:"skillPaths,omitempty"`
+	LicenseAllow []string `json:"licenseAllow,omitempty"`
+	Branch       string   `json:"branch,omitempty"`
+	// Candidates currently staged from this source, so the UI can show which
+	// sources are actually producing anything — a source that has yielded
+	// nothing across many runs is a candidate for removal.
+	Staged int `json:"staged"`
+}
+
+// HarvestCandidate is one staged skill awaiting review.
+type HarvestCandidate struct {
+	Source   string `json:"source"`
+	Name     string `json:"name"`
+	Verdict  string `json:"verdict"`
+	Reason   string `json:"reason"`
+	Domain   string `json:"domain,omitempty"`
+	StagedAt string `json:"stagedAt,omitempty"`
+}
+
+// HarvestStatus is the whole picture for the settings UI.
+type HarvestStatus struct {
+	ManifestPath string             `json:"manifestPath"`
+	Sources      []HarvestSource    `json:"sources"`
+	Candidates   []HarvestCandidate `json:"candidates"`
+	// Verdicts already cached, i.e. how much of a scheduled run is free.
+	CachedVerdicts int    `json:"cachedVerdicts"`
+	Error          string `json:"error,omitempty"`
+}
+
+// HarvestStatusHandler reports harvest configuration and staged candidates.
+type HarvestStatusHandler func() HarvestStatus
+
+// SkillEntry is one registered skill and whether the active soul exposes it.
+type SkillEntry struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Exposed     bool   `json:"exposed"`
+	// Source distinguishes where a skill came from, since that decides who
+	// maintains it: "builtin" ships in the repo, "mcp" comes from an external
+	// server configured in mcp.json.
+	Source string `json:"source"`
+}
+
+// SkillStatus answers "what can this agent actually do right now".
+//
+// The same registry produces a different answer per soul, because each soul's
+// skills.enable list is its own. Reporting registered and exposed separately
+// is the point: "the skill is loaded but this soul can't see it" is the most
+// common confusion, and a single flat list hides it.
+type SkillStatus struct {
+	Soul string `json:"soul"`
+	// EnablePatterns is the soul's raw allowlist, wildcards included.
+	EnablePatterns []string     `json:"enablePatterns"`
+	Skills         []SkillEntry `json:"skills"`
+	// Missing are enable entries matching nothing registered — typos, or a
+	// skill that failed to load. Worth surfacing: the agent silently lacks a
+	// capability its soul claims to grant.
+	Missing []string `json:"missing,omitempty"`
+	// Extras are patterns added from the settings UI on top of the soul's own
+	// list. Reported separately so the UI can show which toggles are its own
+	// doing and which come from the (read-only) soul file.
+	Extras []string `json:"extras,omitempty"`
+	Counts struct {
+		Registered int `json:"registered"`
+		Exposed    int `json:"exposed"`
+	} `json:"counts"`
+}
+
+// SkillStatusHandler reports the active soul's skill exposure.
+type SkillStatusHandler func() SkillStatus
+
+// SkillExtrasHandler adds or removes an extra enable pattern for the active
+// soul. Additive overlay only — it never edits the soul file.
+type SkillExtrasHandler func(pattern string, enable bool) error
+
 type Server struct {
 	addr             string
 	chatHandler      ChatHandler
@@ -128,6 +228,12 @@ type Server struct {
 	soulSwitch       SoulSwitchHandler
 	brainSwitch      BrainSwitchHandler
 	sessionReset     SessionResetHandler
+	mcpStatus        MCPStatusHandler
+	harvestStatus    HarvestStatusHandler
+	skillStatus      SkillStatusHandler
+	acceptHandler    AcceptHandler
+	skillExtras      SkillExtrasHandler
+	accepts          *acceptRegistry
 	allowedDirs      []string // /file allow-list (absolute, cleaned)
 
 	mu          sync.Mutex
@@ -142,10 +248,10 @@ type Server struct {
 	// Live-screen feed cache. 800ms TTL absorbs client polling faster
 	// than the macOS screencapture call returns (~100ms). All access
 	// guarded by mu.
-	liveScreen      LiveScreenCapture
-	liveScreenInfo  LiveScreenInfo
-	liveCache       []byte
-	liveCacheStamp  time.Time
+	liveScreen     LiveScreenCapture
+	liveScreenInfo LiveScreenInfo
+	liveCache      []byte
+	liveCacheStamp time.Time
 }
 
 // New constructs a server. allowedDirs are filesystem prefixes that
@@ -161,7 +267,8 @@ func New(addr string, allowedDirs []string, h ChatHandler) *Server {
 	}
 	return &Server{
 		addr: addr, chatHandler: h, allowedDirs: clean,
-		subs: make(map[chan Event]struct{}),
+		subs:    make(map[chan Event]struct{}),
+		accepts: newAcceptRegistry(),
 	}
 }
 
@@ -190,6 +297,19 @@ func (s *Server) SetBrainSwitchHandler(h BrainSwitchHandler) { s.brainSwitch = h
 // back to clearing only client-side state (which leaves the kernel's
 // history buffer dirty — the bug this endpoint exists to fix).
 func (s *Server) SetSessionResetHandler(h SessionResetHandler) { s.sessionReset = h }
+
+// SetMCPStatusHandler wires GET /api/mcp. Optional: without it the endpoint
+// reports an empty server list rather than failing.
+func (s *Server) SetMCPStatusHandler(h MCPStatusHandler) { s.mcpStatus = h }
+
+// SetHarvestStatusHandler wires GET /api/harvest.
+func (s *Server) SetHarvestStatusHandler(h HarvestStatusHandler) { s.harvestStatus = h }
+
+// SetSkillStatusHandler wires GET /api/skills.
+func (s *Server) SetSkillStatusHandler(h SkillStatusHandler) { s.skillStatus = h }
+
+// SetSkillExtrasHandler wires POST /api/skills/extras.
+func (s *Server) SetSkillExtrasHandler(h SkillExtrasHandler) { s.skillExtras = h }
 
 // EventLogger is called for every event Push'd to subscribers. Used
 // by the recorder in serve.go to append events to a JSONL session
@@ -342,6 +462,12 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/api/soul", s.handleSoul)
 	mux.HandleFunc("/api/brain", s.handleBrain)
 	mux.HandleFunc("/api/session/reset", s.handleSessionReset)
+	mux.HandleFunc("/api/mcp", s.handleMCP)
+	mux.HandleFunc("/api/harvest", s.handleHarvest)
+	mux.HandleFunc("/api/skills", s.handleSkills)
+	mux.HandleFunc("/api/skills/extras", s.handleSkillExtras)
+	mux.HandleFunc("/api/harvest/accept", s.handleAcceptStart)
+	mux.HandleFunc("/api/harvest/accept/status", s.handleAcceptStatus)
 	mux.HandleFunc("/api/screen/current.jpg", s.handleLiveScreen)
 	mux.HandleFunc("/api/screen/info", s.handleLiveScreenInfo)
 	mux.HandleFunc("/api/voice/transcribe", s.handleVoiceTranscribe)
@@ -504,6 +630,103 @@ func (s *Server) handleChatDelete(w http.ResponseWriter, _ *http.Request) {
 
 // handleSouls returns the list of souls available to swap to.
 // JSON: [{path, name, brain, active}]. 501 if the handler isn't wired.
+// handleMCP reports configured MCP servers and whether they connected.
+//
+// Read-only. Editing goes through the config file, because the servers are
+// launched at kernel start: accepting a write here would leave the UI showing
+// a server the running kernel has never heard of.
+func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if s.mcpStatus == nil {
+		// Not wired is not an error — a kernel built without MCP support
+		// should answer "no servers", not 501, so the UI can render an empty
+		// state instead of a failure.
+		_ = json.NewEncoder(w).Encode([]MCPServerStatus{})
+		return
+	}
+	out := s.mcpStatus()
+	if out == nil {
+		out = []MCPServerStatus{}
+	}
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+// handleHarvest reports the skill sources and what they've staged.
+//
+// Read-only, like /api/mcp: harvest runs on a schedule and writes to disk, so
+// a write endpoint here would be editing state a background job owns.
+// handleSkills reports which skills the active soul exposes to the model.
+func (s *Server) handleSkills(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if s.skillStatus == nil {
+		_ = json.NewEncoder(w).Encode(SkillStatus{Skills: []SkillEntry{}})
+		return
+	}
+	out := s.skillStatus()
+	if out.Skills == nil {
+		out.Skills = []SkillEntry{}
+	}
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+// handleSkillExtras toggles one extra enable pattern for the active soul.
+//
+// Writes to the overlay file, never to the soul. Enabling a skill this way is
+// the user granting their own agent a capability; the soul file stays exactly
+// as they wrote it, comments and all.
+func (s *Server) handleSkillExtras(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.skillExtras == nil {
+		http.Error(w, `{"error":"extras not wired"}`, http.StatusNotImplemented)
+		return
+	}
+	var body struct {
+		Pattern string `json:"pattern"`
+		Enable  bool   `json:"enable"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Pattern == "" {
+		http.Error(w, `{"error":"pattern required"}`, http.StatusBadRequest)
+		return
+	}
+	if err := s.skillExtras(body.Pattern, body.Enable); err != nil {
+		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+}
+
+func (s *Server) handleHarvest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if s.harvestStatus == nil {
+		_ = json.NewEncoder(w).Encode(HarvestStatus{Sources: []HarvestSource{}, Candidates: []HarvestCandidate{}})
+		return
+	}
+	out := s.harvestStatus()
+	if out.Sources == nil {
+		out.Sources = []HarvestSource{}
+	}
+	if out.Candidates == nil {
+		out.Candidates = []HarvestCandidate{}
+	}
+	_ = json.NewEncoder(w).Encode(out)
+}
+
 func (s *Server) handleSouls(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "GET only", http.StatusMethodNotAllowed)

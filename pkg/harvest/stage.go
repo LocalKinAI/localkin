@@ -61,7 +61,13 @@ func CleanSourceStage(home, sourceName string) error {
 // pipeline does NOT modify it. Curator's full response is saved to
 // judge.txt for human review.
 func StageJudged(home string, src Source, cand JudgeCandidate, originalContent string, judge *JudgeResult) (string, error) {
-	dir := filepath.Join(StagedRoot(home), src.Name, cand.Name)
+	// Sanitized for the same reason as StageReference: cand.Name is
+	// third-party frontmatter being used as a path component.
+	safe := sanitizeName(cand.Name)
+	if safe == "" {
+		safe = "unnamed"
+	}
+	dir := filepath.Join(StagedRoot(home), sanitizeName(src.Name), safe)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("mkdir staged dir: %w", err)
 	}
@@ -154,6 +160,10 @@ func verdictOrder(v JudgeVerdict) int {
 		return 1
 	case JudgeNo:
 		return 2
+	case JudgeReference:
+		// After the actionable verdicts: reference material is for reading
+		// later, not for the review queue competing with forgeable candidates.
+		return 3
 	}
 	return 99
 }
@@ -191,20 +201,20 @@ func (s *StagedSkill) fillFromMeta() {
 
 // AcceptOptions configures one --accept call.
 type AcceptOptions struct {
-	Home           string
-	KinclawBin     string
-	CoderSoulPath  string // resolved souls/coder.soul.md; empty disables forge (library-fallback only)
-	SkillsDir      string // ./skills/ — destination for forged candidates
-	LibraryDir     string // ./skills/library/ — destination for coder-deferred candidates
-	Out            io.Writer
+	Home          string
+	KinclawBin    string
+	CoderSoulPath string // resolved souls/coder.soul.md; empty disables forge (library-fallback only)
+	SkillsDir     string // ./skills/ — destination for forged candidates
+	LibraryDir    string // ./skills/library/ — destination for coder-deferred candidates
+	Out           io.Writer
 }
 
 // AcceptResult tells the caller what happened to a --accept invocation.
 type AcceptResult struct {
-	Verdict     AcceptVerdict
-	DestPath    string // where the candidate landed
-	Reason      string // forged reason / coder defer reason / error
-	ForgedName  string // skill name as parsed from the forged SKILL.md (when Forged)
+	Verdict    AcceptVerdict
+	DestPath   string // where the candidate landed
+	Reason     string // forged reason / coder defer reason / error
+	ForgedName string // skill name as parsed from the forged SKILL.md (when Forged)
 }
 
 // AcceptVerdict is the four-way outcome of accept:
@@ -380,4 +390,144 @@ func loadFromString(skillContent string) (*skill.ExternalSkill, error) {
 		return nil, fmt.Errorf("tmp write: %w", err)
 	}
 	return skill.LoadExternalSkill(tmpSkill)
+}
+
+// sanitizeName makes a candidate name safe to use as a path component.
+//
+// Candidate names come from frontmatter in third-party repositories, and they
+// are used to build directory and file paths. A name of "../../../tmp/x" would
+// otherwise write outside the harvest tree entirely. Keeping only characters
+// that can appear in a skill identifier removes the whole class rather than
+// blacklisting the traversal sequences people think to test for.
+func sanitizeName(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-', r == '_', r == '.':
+			// Dots are allowed inside a name but a name that is only dots
+			// (".", "..") is rejected below — that is the traversal case.
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+	out := strings.Trim(b.String(), ".-")
+	if out == "" {
+		return ""
+	}
+	return out
+}
+
+// ReferenceRoot is where reference-only candidates are archived.
+//
+// Deliberately outside StagedRoot: `--review` and `--accept` operate on staged
+// candidates, and reference material must never be forgeable — it is kept for
+// reading, not for turning into a skill. Separate directories make that
+// structural instead of a flag someone has to remember to check.
+func ReferenceRoot(home string) string {
+	return filepath.Join(home, ".kinclaw", "harvest", "reference")
+}
+
+// StageReference archives a candidate the curator marked as reference.
+//
+// Stores the original text unchanged plus the curator's reasoning. No forging
+// happens here and none ever will — the value of this material is the idea it
+// describes, which is lost the moment it is compressed into a command line.
+func StageReference(home string, src Source, cand JudgeCandidate, content string, res *JudgeResult) (string, error) {
+	dir := filepath.Join(ReferenceRoot(home), src.Name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+
+	base := sanitizeName(cand.Name)
+	if base == "" {
+		base = "unnamed"
+	}
+	path := filepath.Join(dir, base+".md")
+
+	var b strings.Builder
+	b.WriteString("<!-- harvested reference — not a skill, never forged -->\n")
+	fmt.Fprintf(&b, "<!-- source: %s -->\n", src.URL)
+	fmt.Fprintf(&b, "<!-- file:   %s -->\n", cand.SkillRelPath)
+	fmt.Fprintf(&b, "<!-- why:    %s -->\n\n", res.Reason)
+	b.WriteString(content)
+
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// ListReference returns archived reference material, newest first.
+func ListReference(home string) ([]ReferenceDoc, error) {
+	root := ReferenceRoot(home)
+	entries, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var out []ReferenceDoc
+	for _, srcDir := range entries {
+		if !srcDir.IsDir() {
+			continue
+		}
+		files, err := os.ReadDir(filepath.Join(root, srcDir.Name()))
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if f.IsDir() || !strings.HasSuffix(f.Name(), ".md") {
+				continue
+			}
+			doc := ReferenceDoc{
+				SourceName: srcDir.Name(),
+				Name:       strings.TrimSuffix(f.Name(), ".md"),
+				Path:       filepath.Join(root, srcDir.Name(), f.Name()),
+			}
+			if info, err := f.Info(); err == nil {
+				doc.ArchivedAt = info.ModTime()
+			}
+			doc.fillReason()
+			out = append(out, doc)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].ArchivedAt.After(out[j].ArchivedAt)
+	})
+	return out, nil
+}
+
+// ReferenceDoc is one archived reference document.
+type ReferenceDoc struct {
+	SourceName string
+	Name       string
+	Path       string
+	Reason     string
+	ArchivedAt time.Time
+}
+
+// fillReason pulls the curator's rationale back out of the header comment.
+func (d *ReferenceDoc) fillReason() {
+	data, err := os.ReadFile(d.Path)
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n")[:min(8, len(strings.Split(string(data), "\n")))] {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "<!-- why:"); ok {
+			d.Reason = strings.TrimSpace(strings.TrimSuffix(rest, "-->"))
+			return
+		}
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

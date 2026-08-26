@@ -93,7 +93,7 @@ body_excerpt: <first 800 chars of markdown body>
 ## 输出（严格三行）
 
 ```
-verdict: <yes | maybe | no>
+verdict: <yes | maybe | reference | no>
 reason: <one sentence — 补什么 gap / 已有了 / 出 scope>
 domain: <短词分类 — apple / git / web / ml / creative / debugging / ...>
 ```
@@ -103,20 +103,31 @@ domain: <短词分类 — apple / git / web / ml / creative / debugging / ...>
 - **yes** = 明确补现有 skills/ 的 gap，且能用 `command + args` 表达
   （即使现在 forge 不出来也算 — 概念上能 exec 化的）
 - **maybe** = 概念有用但部分重叠 / 需要进一步看 / 边界不清
-- **no** = 已有等价 / 是 LLM workflow / 出 KinClaw scope
+- **reference** = **forge 不出来，但思想值得留** — 方法论、写作/设计规范、
+  「怎么做某件事」的指南（skill-creator / mcp-builder / brand-guidelines 这类）。
+  归档到 `harvest/reference/` 供人翻阅，**永不进 skills/**、永不 forge。
+  这一档是为了不把 harvest 真正的价值扔掉：外部 skill 库里最值钱的常常
+  不是能直接跑的命令，而是别人想问题的方式。
+- **no** = 已有等价 / 出 KinClaw scope / 纯粹的重复文档 —
+  **注意：「是 LLM workflow」本身不再是 no 的理由**。先问它有没有可借鉴的
+  方法论：有 → reference；没有（只是重复你已有的东西、或纯粹的产品文档）→ no。
 
 `reason:` 必须**具体**：
 - ❌ "useful skill"（空话）
 - ✅ "wraps `remindctl` CLI for Apple Reminders — fills gap, no overlap with current skills"
 - ✅ "duplicates existing git_commit"
 - ✅ "needs LLM round-trips for creative reasoning, can't be exec-form"
+- ✅ (reference) "can't be exec-form, but its skill-authoring checklist is worth keeping"
 
 `domain:` 用 1-2 词，pipeline 可能用它做后续分组。
 
 ## 判断维度（按重要性排）
 
 1. **KinClaw 已有同类 skill？** → no, redundant
-2. **能用单个 shell exec 表达？** → 不能就 no（除非 yes 但标注 caveat）
+2. **能用单个 shell exec 表达？** → 能 → yes；
+   不能 → 再问一步：**它教的东西对「怎么写 skill / 怎么设计 agent / 怎么组织
+   某类工作」有借鉴价值吗？** 有 → **reference**，没有 → no。
+   直接跳到 no 会丢掉 harvest 存在的理由。
 3. **真填了 KinClaw 能力空白？** → yes
 4. **依赖某个 binary（remindctl / pmset / brew CLI）？** → maybe（用户得自己装），reason 写明
 5. **macOS-native 优先**：依赖 macOS-only CLI 加分；Linux-only / 通用 SaaS 减分（但不一定 no）

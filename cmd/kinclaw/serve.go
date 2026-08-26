@@ -20,16 +20,21 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/LocalKinAI/kinclaw/pkg/brain"
+	"github.com/LocalKinAI/kinclaw/pkg/harvest"
+	"github.com/LocalKinAI/kinclaw/pkg/mcp"
 	"github.com/LocalKinAI/kinclaw/pkg/server"
 	"github.com/LocalKinAI/kinclaw/pkg/skill"
 	"github.com/LocalKinAI/kinclaw/pkg/soul"
@@ -117,7 +122,7 @@ Flags:
 		os.Exit(1)
 	}
 
-	sess, err := newSession(path, *debug)
+	sess, err := newSession(path, *debug, false)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -253,7 +258,7 @@ Flags:
 		}
 		defer turnMu.Unlock()
 
-		newSess, err := newSession(newPath, *debug)
+		newSess, err := newSession(newPath, *debug, false)
 		if err != nil {
 			return err
 		}
@@ -434,6 +439,60 @@ Flags:
 	srv.SetBrainSwitchHandler(brainSwitchHandler)
 	srv.SetSessionResetHandler(sessionResetHandler)
 
+	// GET /api/mcp — what the settings UI renders.
+	//
+	// Reads through sessMu because a soul switch rebuilds the registry and
+	// reconnects every server, so this list changes under us.
+	// GET /api/harvest — skill sources + what they've staged.
+	//
+	// Read from disk on each request rather than cached at startup: harvest
+	// runs from a LaunchAgent at 03:00, so the files change while this
+	// process is running and a snapshot would go stale by morning.
+	srv.SetHarvestStatusHandler(harvestStatus)
+
+	// POST /api/harvest/accept — forge a staged candidate into skills/.
+	//
+	// The one write operation in the settings surface, and it writes *code*
+	// into the user's repo via the coder agent. Kept behind an explicit call
+	// rather than folded into a status endpoint so it can never fire as a side
+	// effect of the UI merely displaying something.
+	srv.SetAcceptHandler(acceptStagedCandidate)
+
+	// POST /api/skills/extras — grant the active soul an extra skill without
+	// touching its file.
+	srv.SetSkillExtrasHandler(func(pattern string, enable bool) error {
+		sessMu.Lock()
+		s := currentSess
+		sessMu.Unlock()
+		if s == nil {
+			return fmt.Errorf("no active session")
+		}
+		if err := toggleSkillExtra(s.soul.Meta.Name, pattern, enable); err != nil {
+			return err
+		}
+		// Recompute immediately: the whole point of an overlay is that it
+		// takes effect without a restart, unlike editing the soul.
+		sessMu.Lock()
+		s.toolDefs = s.registry.FilteredToolDefs(effectiveEnable(s.soul))
+		sessMu.Unlock()
+		return nil
+	})
+
+	// GET /api/skills — what the *active* soul can actually use.
+	srv.SetSkillStatusHandler(func() server.SkillStatus {
+		sessMu.Lock()
+		s := currentSess
+		sessMu.Unlock()
+		return skillStatusFor(s)
+	})
+
+	srv.SetMCPStatusHandler(func() []server.MCPServerStatus {
+		sessMu.Lock()
+		s := currentSess
+		sessMu.Unlock()
+		return mcpStatusFor(s)
+	})
+
 	// Detached-spawn delivery: when a child kinclaw subprocess finishes
 	// in the background (pilot dispatched it with `spawn(...)` while
 	// the user kept chatting), we get the result here. Two deliveries:
@@ -597,7 +656,7 @@ func runTurn(ctx context.Context, sess *session, srv *server.Server, input strin
 				sess.store.SaveMessage(sess.id, assistantMsg)
 			}
 			if forgeFired {
-				sess.toolDefs = sess.registry.FilteredToolDefs(sess.soul.Meta.Skills.Enable)
+				sess.toolDefs = sess.registry.FilteredToolDefs(effectiveEnable(sess.soul))
 			}
 			srv.Push(server.Event{Type: "turn_done"})
 			return
@@ -1019,3 +1078,248 @@ func runReplayServer(ctx context.Context, addr, replayPath string) {
 	}
 }
 
+// mcpStatusFor merges a session's MCP config with what actually happened when
+// those servers were loaded.
+//
+// Both halves are needed. Config alone can't say whether a server works;
+// runtime results alone lose servers that are configured but disabled, and
+// those must still appear in the UI or the user can't turn them back on.
+func mcpStatusFor(s *session) []server.MCPServerStatus {
+	if s == nil || s.mcpConfig == nil {
+		return nil
+	}
+
+	// Tools grouped by the server that published them, so the UI can show
+	// what each one actually contributed rather than a bare count.
+	toolsByServer := map[string][]string{}
+	for _, c := range s.mcpClients {
+		for _, t := range c.Tools() {
+			toolsByServer[c.Name()] = append(toolsByServer[c.Name()], t.Name)
+		}
+	}
+
+	byName := map[string]mcp.LoadResult{}
+	for _, r := range s.mcpResults {
+		byName[r.Name] = r
+	}
+
+	names := make([]string, 0, len(s.mcpConfig.MCPServers))
+	for name := range s.mcpConfig.MCPServers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	out := make([]server.MCPServerStatus, 0, len(names))
+	for _, name := range names {
+		cfg := s.mcpConfig.MCPServers[name]
+		res := byName[name]
+
+		st := server.MCPServerStatus{
+			Name:      name,
+			Command:   cfg.Command,
+			Args:      cfg.Args,
+			Disabled:  cfg.Disabled,
+			ToolCount: res.ToolCount,
+			Tools:     toolsByServer[name],
+			LogPath:   mcp.ServerLogPath(name),
+		}
+		if res.Err != nil {
+			st.Error = res.Err.Error()
+		}
+		// Connected means tools were actually retrieved — a process that
+		// started and then failed the handshake is not usable, and showing it
+		// as connected would be the misleading half of "configured but
+		// silently broken".
+		st.Connected = res.Err == nil && !cfg.Disabled && res.ToolCount > 0
+		out = append(out, st)
+	}
+	return out
+}
+
+// harvestStatus reads the harvest manifest and staged candidates.
+//
+// Errors are returned in the payload instead of failing the request: a
+// missing manifest is the normal state for someone who has never run harvest,
+// and the settings UI should render an empty state for that, not an error.
+func harvestStatus() server.HarvestStatus {
+	out := server.HarvestStatus{ManifestPath: harvest.DefaultManifestPath()}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		out.Error = err.Error()
+		return out
+	}
+
+	staged, err := harvest.ListStaged(home)
+	if err != nil {
+		out.Error = err.Error()
+	}
+
+	stagedPerSource := map[string]int{}
+	for _, s := range staged {
+		stagedPerSource[s.SourceName]++
+		out.Candidates = append(out.Candidates, server.HarvestCandidate{
+			Source:   s.SourceName,
+			Name:     s.SkillName,
+			Verdict:  string(s.Verdict),
+			Reason:   s.Reason,
+			Domain:   s.Domain,
+			StagedAt: s.StagedAt.Format(time.RFC3339),
+		})
+	}
+
+	if m, err := harvest.LoadManifest(out.ManifestPath); err == nil {
+		for _, src := range m.Sources {
+			out.Sources = append(out.Sources, server.HarvestSource{
+				Name:         src.Name,
+				URL:          src.URL,
+				SkillPaths:   src.SkillPaths,
+				LicenseAllow: src.LicenseAllow,
+				Branch:       src.Branch,
+				Staged:       stagedPerSource[src.Name],
+			})
+		}
+	} else if out.Error == "" {
+		out.Error = err.Error()
+	}
+
+	out.CachedVerdicts = harvest.LoadVerdictCache(home).Len()
+	return out
+}
+
+// skillStatusFor reports which registered skills the session's soul exposes.
+//
+// Registered and exposed are deliberately separate numbers. Every skill in the
+// registry is loaded and working; whether the model can see it is a per-soul
+// decision made by skills.enable. "It's loaded but my agent says it can't do
+// that" is the single most common confusion here, and collapsing the two into
+// one list is what causes it.
+func skillStatusFor(s *session) server.SkillStatus {
+	var out server.SkillStatus
+	if s == nil || s.registry == nil {
+		return out
+	}
+	out.Soul = s.soul.Meta.Name
+	out.EnablePatterns = s.soul.Meta.Skills.Enable
+	out.Extras = skill.LoadExtras(skill.ExtrasPath()).For(s.soul.Meta.Name)
+
+	// Exposure is computed from the merged list — soul plus extras — because
+	// that is what FilteredToolDefs actually feeds the model. Reporting only
+	// the soul's list would show a skill as hidden while the agent is using it.
+	merged := effectiveEnable(s.soul)
+
+	names := s.registry.AllNames()
+	out.Counts.Registered = len(names)
+
+	for _, name := range names {
+		entry := server.SkillEntry{
+			Name:    name,
+			Exposed: skill.MatchesAllow(merged, name),
+			Source:  "builtin",
+		}
+		if strings.HasPrefix(name, mcp.NamePrefix) {
+			entry.Source = "mcp"
+		}
+		if sk, err := s.registry.Get(name); err == nil {
+			entry.Description = sk.Description()
+		}
+		if entry.Exposed {
+			out.Counts.Exposed++
+		}
+		out.Skills = append(out.Skills, entry)
+	}
+
+	// Enable entries that match nothing. A wildcard counts as matched if any
+	// registered skill has that prefix, so `mcp_github_*` isn't reported as
+	// missing merely because that server happens to be down.
+	for _, pattern := range merged {
+		matched := false
+		for _, name := range names {
+			if skill.MatchesAllow([]string{pattern}, name) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			out.Missing = append(out.Missing, pattern)
+		}
+	}
+	return out
+}
+
+// acceptStagedCandidate forges one staged candidate, for POST /api/harvest/accept.
+//
+// Paths mirror the CLI defaults (skills/ and skills/library/) resolved against
+// the same search order the kernel uses to load skills — otherwise a skill
+// forged from the UI would land somewhere the running agent never reads, and
+// appear to have silently done nothing.
+func acceptStagedCandidate(skillID string) (verdict, destPath, forgedName, reason string, err error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", "", "", err
+	}
+	bin, err := os.Executable()
+	if err != nil {
+		return "", "", "", "", err
+	}
+
+	skillsDir := primarySkillsDir()
+	opts := harvest.AcceptOptions{
+		Home:          home,
+		KinclawBin:    bin,
+		CoderSoulPath: resolveSoulFile("coder.soul.md"),
+		SkillsDir:     skillsDir,
+		LibraryDir:    filepath.Join(skillsDir, "library"),
+		Out:           io.Discard,
+	}
+
+	// 5 minutes: coder's own forge timeout is 240s, and this must outlast it
+	// so a slow-but-succeeding forge isn't killed by its own supervisor.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	res, err := harvest.AcceptStaged(ctx, opts, skillID)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	return string(res.Verdict), res.DestPath, res.ForgedName, res.Reason, nil
+}
+
+// primarySkillsDir is where a forged skill should land: the first directory
+// the kernel actually searches, so the result is loadable on next start.
+func primarySkillsDir() string {
+	dirs := skillSearchDirs("skills")
+	if len(dirs) > 0 {
+		return dirs[0]
+	}
+	return "skills"
+}
+
+// toggleSkillExtra adds or removes one pattern from the per-soul overlay.
+func toggleSkillExtra(soulName, pattern string, enable bool) error {
+	path := skill.ExtrasPath()
+	if path == "" {
+		return fmt.Errorf("no home directory")
+	}
+	extras := skill.LoadExtras(path)
+	if extras.BySoul == nil {
+		extras.BySoul = map[string][]string{}
+	}
+
+	current := extras.BySoul[soulName]
+	next := make([]string, 0, len(current)+1)
+	for _, p := range current {
+		if p != pattern {
+			next = append(next, p)
+		}
+	}
+	if enable {
+		next = append(next, pattern)
+	}
+	if len(next) == 0 {
+		delete(extras.BySoul, soulName)
+	} else {
+		extras.BySoul[soulName] = next
+	}
+	return extras.Save(path)
+}

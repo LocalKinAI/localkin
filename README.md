@@ -345,6 +345,57 @@ so downstream users never need `clang` or `CGO_ENABLED`. See
 [Paper #9 on localkin.dev](https://www.localkin.dev/papers/embedded-dylib)
 for the full architectural story.
 
+## MCP servers — tools from outside this repo
+
+kinclaw can use tools published by any [Model Context Protocol](https://modelcontextprotocol.io)
+server. Configure them in `~/.localkin/mcp.json`, using the same `mcpServers`
+block Claude Desktop uses — a server's published install snippet pastes in
+unchanged:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "~/Desktop"]
+    }
+  }
+}
+```
+
+Then let a soul see them via `skills.enable`:
+
+```yaml
+skills:
+  enable:
+    - "mcp_*"                 # every configured server
+    - "mcp_filesystem_*"      # or just one
+```
+
+Tools register as `mcp_<server>_<tool>` alongside the built-ins and reach the
+model through the same path. Namespacing isn't cosmetic: server tool names come
+from third parties and collide freely with built-ins like `read` or `search`.
+
+Startup reports each server's fate, and a failure points at its own output:
+
+```
+[mcp] ✓ filesystem: 14 tool(s)
+[mcp] ✗ github: fork/exec ...: no such file (server output: ~/.localkin/logs/mcp-server-github.log)
+[mcp] – slack: disabled
+```
+
+`mcpServers` only ever describes **local stdio servers** — remote ones are
+added through OAuth in a host UI, not this file, which is why there are no
+`url`/`headers` fields.
+
+**MCP or a skill?** MCP is for capabilities someone else maintains and that
+change under you — GitHub's API, Slack's auth. A skill is for your own domain
+logic, for anything needing kinclaw's internals (soul, memory, spawn), and for
+stable algorithms worth owning. `kinclaw harvest` sits between them: it takes
+*ideas* from external libraries and forges them into skills you then maintain.
+
+---
+
 ## Soul schema
 
 A soul file is YAML frontmatter + a Markdown system prompt.
