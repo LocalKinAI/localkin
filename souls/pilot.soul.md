@@ -52,6 +52,64 @@ permissions:
   record: true
   spawn: true            # 允许派遣专才子 agent (researcher / eye / critic ...)
 
+  # ── 权限门 (v1.18, learned from Claude Code) ──
+  # mode: ask → 命中 ask 规则的调用先问人再跑 (REPL 里是终端提示,
+  # KinClaw Mac 里是审批卡片: Allow / Always this session / Deny)。
+  # 规则语法: 技能名 / 前缀* / 技能(主参数前缀*)。allow 先于 ask 判。
+  # GUI 爪 (ui / input / screen) 故意不在 ask 里 — Cowork 里点击就是
+  # 工作本身,每次点都问等于没法用;要管就加 "ui(click*)"。
+  # shell 里看起来不可逆的命令 (rm -r / sudo / git push / kill ...)
+  # 在 ask 模式下永远会问,除非 allow 里明确放行。
+  # 脚本驱动时用 `kinclaw -permissions auto` 整体覆盖。
+  mode: ask
+  ask:
+    - "shell"
+    - "file_write"
+    - "file_edit"
+    - "forge"
+    - "mcp_*"
+    - "imsg_send"
+    - "cerebellum(mail*)"
+  allow:
+    - "shell(ls*)"
+    - "shell(cat*)"
+    - "shell(head*)"
+    - "shell(tail*)"
+    - "shell(grep*)"
+    - "shell(rg*)"
+    - "shell(find*)"
+    - "shell(pwd*)"
+    - "shell(echo*)"
+    - "shell(which*)"
+    - "shell(git status*)"
+    - "shell(git log*)"
+    - "shell(git diff*)"
+    - "shell(open -a*)"
+    # 注意: 没放行 shell(osascript*) — cerebellum 已覆盖日常 AppleScript
+    # 且不在 ask 里;裸 osascript 走 shell 时问一下,防 "empty trash" 类
+    - "shell(mdfind*)"
+    - "shell(defaults read*)"
+    - "shell(pmset -g*)"
+    - "file_write(~/Library/Caches/kinclaw*)"
+    - "file_write(~/.kinclaw*)"
+    - "file_edit(~/.kinclaw*)"
+
+# ── 上下文压缩 (v1.18) ──
+# prompt 超过 context_length × compact_at 时,内核把旧对话折叠成一段
+# 模型写的摘要,保留最近 keep_recent 条原文。/compact 或 Mac 端可手动触发。
+context:
+  compact_at: 0.75
+  keep_recent: 8
+
+# ── hooks (v1.18, 可选) ── 在固定节点跑用户自己的 shell 命令。
+# exit 2 = 阻止 (pre_tool: 不执行,stderr 给模型看)。例子:
+# hooks:
+#   pre_tool:
+#     - match: "input"
+#       run: "./hooks/no-typing-while-zoom.sh"
+#   stop:
+#     - run: "afplay /System/Library/Sounds/Glass.aiff"
+
 skills:
   enable:
     - "screen"
@@ -150,7 +208,10 @@ Kernel 会在你跑偏时硬挡——多匹配 / destructive 角色 / 同结果�
 - 不绕 "Are you sure" / "Confirm" 对话框
 - 不 `sudo`、不 `curl ... | sh`、不 `rm -rf /`、不 `dd of=/dev/*`
 - 不读写 `~/.ssh` `~/.aws` `~/.config/gcloud`
-- 破坏性操作（rm 系统文件、覆盖非空文件、git reset / push）先问用户
+- 破坏性操作（rm 系统文件、覆盖非空文件、git reset / push）先问用户。
+  内核也会替你把关：命中 `permissions.ask` 的调用会弹给用户批;被拒时
+  你会收到 "Permission denied by the user" —— **不要换个说法重试**,
+  说明你想做什么、问怎么办。Plan mode 下只能看不能动,先给方案再等批准
 - **不编造工具没抓到的事实**。任何写进给用户回复里的**具体数字 /
   评分 / 奖项 / 价格 / 电话 / 地址 / 年份 / 商家名 / URL** 必须能
   在你这一轮的某个 tool result 里**字面找到**。找不到就别写，或者
@@ -248,8 +309,8 @@ after 10m0s]\n\nERROR: child timed out after 600s\n\n<partial output>`,
 - 错误码含义("AXError -25205 = 元素不可达")
 - 有效快捷键("cmd+N 比 ui click 更稳")
 - 绕路成功的方法
-- 用法: `learn topic=<bundle_id> note=<one line>`
-- 落地: `~/.localkin/learned.md`,下次 boot 自动进 prompt
+- 用法: `learn topic=<bundle_id> note=<one line>`;`learn action=list` 看目录;`learn action=recall topic=X` 读被 prompt 预算截掉的老 section
+- 落地: `~/.kinclaw/learned.md`,下次 boot 自动进 prompt (超 8KB 时只带目录 + 最新几段)
 
 **`memory`** —— 关于"用户"的长期事实(下次还要记得):
 - 用户身份: 名字 / 在哪 / 工作领域 / 偏好语言

@@ -51,8 +51,8 @@ type SQLiteStore struct{ db *sql.DB }
 // alone to users who don't have LocalKin installed, or separating
 // "work" and "personal" agent contexts):
 //
-//   KINCLAW_DATA_DIR=~/.kinclaw kinclaw -soul ...
-//   KINCLAW_DATA_DIR=/tmp/kinclaw-test kinclaw ...
+//	KINCLAW_DATA_DIR=~/.kinclaw kinclaw -soul ...
+//	KINCLAW_DATA_DIR=/tmp/kinclaw-test kinclaw ...
 //
 // Env override only affects the memory.db path; learned.md and
 // serve-sessions/ resolve under ~/.kinclaw/ regardless. (To
@@ -168,6 +168,13 @@ func (s *SQLiteStore) migratePIDSessions() (int, error) {
 		if err := rows.Scan(&sid); err != nil {
 			continue
 		}
+		// One-shot ("<soul>#once-<pid>-<nanos>") and archived
+		// ("<soul>@<timestamp>") buckets are unique by design; folding
+		// them into the soul bucket would undo exactly the isolation
+		// they exist for.
+		if strings.ContainsAny(sid, "#@") {
+			continue
+		}
 		m := pidSuffix.FindStringSubmatch(sid)
 		if len(m) != 2 {
 			continue // already a clean soul name, or unexpected shape
@@ -267,7 +274,116 @@ func (s *SQLiteStore) LoadHistory(sessionID string, limit int) []brain.Message {
 	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
 		messages[i], messages[j] = messages[j], messages[i]
 	}
-	return messages
+	// The window can open mid tool-group (row N-50 is a tool result
+	// whose call sits at row N-51). Providers reject that with a 400 on
+	// the very first call of the new process; sanitize so a resumed
+	// session always starts on a clean turn boundary.
+	return brain.SanitizeHistory(messages)
+}
+
+// SaveMessages persists a slice under sessionID, in order.
+func (s *SQLiteStore) SaveMessages(sessionID string, msgs []brain.Message) error {
+	for _, m := range msgs {
+		if err := s.SaveMessage(sessionID, m); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ArchiveSession moves every row of sessionID to a timestamped archive
+// key ("<id>@2026-09-05T14:03:11") and returns that key plus the row
+// count. This is the non-destructive form of "new session" and the
+// persistence half of compaction: the live key is left empty for the
+// caller to repopulate, and the old conversation stays searchable via
+// `memory action=recall scope=history` and `kinclaw memory sessions`.
+// Nothing is ever deleted.
+func (s *SQLiteStore) ArchiveSession(sessionID string) (string, int, error) {
+	archive := fmt.Sprintf("%s@%s", sessionID, time.Now().Format("2006-01-02T15:04:05"))
+	res, err := s.db.Exec(`UPDATE messages SET session_id = ? WHERE session_id = ?`, archive, sessionID)
+	if err != nil {
+		return "", 0, err
+	}
+	n, _ := res.RowsAffected()
+	return archive, int(n), nil
+}
+
+// SessionInfo summarizes one session_id bucket for listings.
+type SessionInfo struct {
+	ID       string
+	Messages int
+	First    string // created_at of the oldest row (date-hour)
+	Last     string // created_at of the newest row
+}
+
+// Sessions lists every session bucket, most recently active first.
+// Archived buckets ("<soul>@<timestamp>") are included so a user can
+// see what a reset or compaction put aside.
+func (s *SQLiteStore) Sessions() ([]SessionInfo, error) {
+	rows, err := s.db.Query(`
+		SELECT session_id, COUNT(*), MIN(created_at), MAX(created_at)
+		FROM messages GROUP BY session_id ORDER BY MAX(id) DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SessionInfo
+	for rows.Next() {
+		var info SessionInfo
+		if err := rows.Scan(&info.ID, &info.Messages, &info.First, &info.Last); err != nil {
+			continue
+		}
+		if len(info.First) > 16 {
+			info.First = info.First[:16]
+		}
+		if len(info.Last) > 16 {
+			info.Last = info.Last[:16]
+		}
+		out = append(out, info)
+	}
+	return out, nil
+}
+
+// MemoryEntry is one row of the memories table.
+type MemoryEntry struct {
+	Key, Value, UpdatedAt string
+}
+
+// ListMemories returns every durable fact (and, when includeTransient
+// is set, the `_`-prefixed working memory too), newest first.
+func (s *SQLiteStore) ListMemories(includeTransient bool) ([]MemoryEntry, error) {
+	q := `SELECT key, value, updated_at FROM memories`
+	if !includeTransient {
+		q += ` WHERE key NOT LIKE '\_%' ESCAPE '\'`
+	}
+	q += ` ORDER BY updated_at DESC`
+	rows, err := s.db.Query(q)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MemoryEntry
+	for rows.Next() {
+		var e MemoryEntry
+		if err := rows.Scan(&e.Key, &e.Value, &e.UpdatedAt); err != nil {
+			continue
+		}
+		if len(e.UpdatedAt) > 16 {
+			e.UpdatedAt = e.UpdatedAt[:16]
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+// Forget deletes one memory by exact key. Returns false if no such key.
+func (s *SQLiteStore) Forget(key string) (bool, error) {
+	res, err := s.db.Exec(`DELETE FROM memories WHERE key = ?`, key)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 // AllMemories returns durable user facts, most-recently-updated first.

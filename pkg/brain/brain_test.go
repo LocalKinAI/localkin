@@ -224,6 +224,9 @@ func TestRetryDo_MaxAttemptsExhausted(t *testing.T) {
 	calls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
+		// Retry-After: 0 keeps the test instant; the backoff schedule
+		// itself is covered by TestRetryDo_BacksOffOn429AndHonoursRetryAfter.
+		w.Header().Set("Retry-After", "0")
 		w.WriteHeader(503)
 	}))
 	defer srv.Close()
@@ -239,8 +242,8 @@ func TestRetryDo_MaxAttemptsExhausted(t *testing.T) {
 	if resp.StatusCode != 503 {
 		t.Errorf("expected 503 after exhausting retries, got %d", resp.StatusCode)
 	}
-	if calls != 3 {
-		t.Errorf("expected 3 attempts, got %d", calls)
+	if calls != 5 {
+		t.Errorf("expected 5 attempts, got %d", calls)
 	}
 }
 

@@ -1,6 +1,7 @@
 package soul
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -508,5 +509,110 @@ func TestLoadSoul_InvalidYAML(t *testing.T) {
 	_, err := LoadSoul(path)
 	if err == nil {
 		t.Fatal("expected error for invalid YAML")
+	}
+}
+
+func TestParseSoul_PermissionGateAndHooksAndContext(t *testing.T) {
+	data := []byte(`---
+name: gated
+permissions:
+  mode: ask
+  ask: ["shell", "ui(click*)"]
+  allow: ["shell(git status*)"]
+hooks:
+  pre_tool:
+    - match: "input"
+      run: "./guard.sh"
+      timeout: 3
+  stop:
+    - run: "afplay done.aiff"
+context:
+  compact_at: 0.6
+  keep_recent: 12
+---
+body`)
+	s, err := ParseSoul(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := s.Meta.Permissions
+	if p.Mode != "ask" || len(p.Ask) != 2 || p.Ask[1] != "ui(click*)" || len(p.Allow) != 1 {
+		t.Fatalf("permissions: %+v", p)
+	}
+	h := s.Meta.Hooks
+	if len(h.PreTool) != 1 || h.PreTool[0].Match != "input" || h.PreTool[0].Timeout != 3 || len(h.Stop) != 1 {
+		t.Fatalf("hooks: %+v", h)
+	}
+	if s.Meta.Context.CompactAt != 0.6 || s.Meta.Context.KeepRecent != 12 {
+		t.Fatalf("context: %+v", s.Meta.Context)
+	}
+}
+
+func TestParseSoul_DefaultsLeaveGateAuto(t *testing.T) {
+	s, err := ParseSoul([]byte("---\nname: plain\n---\nbody"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Meta.Permissions.Mode != "" || !s.Meta.Hooks.Empty() || s.Meta.Context.CompactAt != 0 {
+		t.Fatalf("unexpected defaults: %+v", s.Meta)
+	}
+}
+
+func TestUserInstructionsAndLearnedNotebook(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cwd := t.TempDir()
+	old, _ := os.Getwd()
+	os.Chdir(cwd)
+	t.Cleanup(func() { os.Chdir(old) })
+
+	os.MkdirAll(filepath.Join(home, ".kinclaw"), 0o755)
+	os.MkdirAll(filepath.Join(home, ".localkin"), 0o755)
+	os.WriteFile(filepath.Join(home, ".kinclaw", "KINCLAW.md"), []byte("Always reply in 中文."), 0o644)
+	os.WriteFile(filepath.Join(cwd, "KINCLAW.md"), []byte("This repo: run make test before commit."), 0o644)
+	// Canonical + legacy notebooks, with one duplicated bullet.
+	os.WriteFile(LearnedPath(), []byte("# notes\n\n## com.apple.Notes\n- cmd+N works\n"), 0o644)
+	os.WriteFile(legacyLearnedPath(), []byte("# notes\n\n## Common: time\n- check date first\n\n## com.apple.Notes\n- cmd+N works\n"), 0o644)
+
+	s, err := ParseSoul([]byte("---\nname: x\n---\nbody"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Always reply in 中文.", "run make test before commit", "cmd+N works", "check date first"} {
+		if !strings.Contains(s.SystemPrompt, want) {
+			t.Errorf("prompt missing %q", want)
+		}
+	}
+	if strings.Count(s.SystemPrompt, "cmd+N works") != 1 {
+		t.Errorf("legacy duplicate bullet should be deduplicated")
+	}
+	if !strings.Contains(s.SystemPrompt, "用户的固定指令") {
+		t.Errorf("KINCLAW.md section header missing")
+	}
+}
+
+func TestLearnedNotebook_IndexWhenOversized(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	os.MkdirAll(filepath.Join(home, ".kinclaw"), 0o755)
+	var sb strings.Builder
+	sb.WriteString("# notes\n")
+	for i := 0; i < 40; i++ {
+		sb.WriteString(fmt.Sprintf("\n## com.example.app%d\n", i))
+		for j := 0; j < 5; j++ {
+			sb.WriteString(fmt.Sprintf("- app%d lesson %d: %s\n", i, j, strings.Repeat("detail ", 8)))
+		}
+	}
+	os.WriteFile(LearnedPath(), []byte(sb.String()), 0o644)
+
+	got := readLearnedNotebook()
+	if len(got) > maxLearnedInPrompt+512 {
+		t.Fatalf("notebook injection exceeds budget: %d", len(got))
+	}
+	if !strings.Contains(got, "Notebook index") || !strings.Contains(got, "com.example.app0 (5)") {
+		t.Fatalf("index should list the oldest topic even though its body was cut: %s", got[:400])
+	}
+	if !strings.Contains(got, "com.example.app39") {
+		t.Fatal("tail should keep the newest topic")
 	}
 }

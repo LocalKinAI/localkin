@@ -58,7 +58,57 @@ type Event struct {
 
 	// error
 	Message string `json:"message,omitempty"`
+
+	// permission_request: what the human is asked to approve. ID is
+	// the request id to echo back on POST /api/permission; Name /
+	// Params describe the call; Summary is the one-line rendering.
+	Summary string `json:"summary,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+
+	// usage: token accounting after each model call. ContextLength is
+	// the soul's window so a UI can draw "62% of context" without
+	// knowing the model. Same field names kincode emits.
+	InputTokens   int `json:"input_tokens,omitempty"`
+	OutputTokens  int `json:"output_tokens,omitempty"`
+	ContextLength int `json:"context_length,omitempty"`
+
+	// plan_mode: the toggle state (true = read-only gate on).
+	PlanMode bool `json:"plan_mode,omitempty"`
+
+	// compacted: how much the fold removed. Message carries the summary
+	// preview; Output carries the full summary text.
+	BeforeTokens int `json:"before_tokens,omitempty"`
+	AfterTokens  int `json:"after_tokens,omitempty"`
 }
+
+// State is the GET /api/state answer — enough for a UI to render its
+// header on connect without waiting for the next event.
+type State struct {
+	Soul           string   `json:"soul"`
+	Brain          string   `json:"brain"`
+	Skills         int      `json:"skills"`
+	PermissionMode string   `json:"permission_mode"`
+	PlanMode       bool     `json:"plan_mode"`
+	SessionAllowed []string `json:"session_allowed,omitempty"`
+	Messages       int      `json:"messages"`
+	InputTokens    int      `json:"input_tokens"`
+	ContextLength  int      `json:"context_length"`
+	// TotalInput / TotalOutput are the running sums for this process —
+	// the /cost view.
+	TotalInput  int `json:"total_input_tokens"`
+	TotalOutput int `json:"total_output_tokens"`
+}
+
+// StateHandler reports the live session state.
+type StateHandler func() State
+
+// PlanModeHandler flips plan mode and returns the resulting state. The
+// handler may refuse (e.g. mid-turn) by returning the old state.
+type PlanModeHandler func(enabled bool) bool
+
+// CompactHandler folds the conversation now. Returns a human-readable
+// outcome line, or an error (nothing to compact, turn in flight).
+type CompactHandler func() (string, error)
 
 // ChatHandler is invoked for every POST /api/chat. Runs in its own
 // goroutine — should call back into Server.Push to stream events.
@@ -233,7 +283,11 @@ type Server struct {
 	skillStatus      SkillStatusHandler
 	acceptHandler    AcceptHandler
 	skillExtras      SkillExtrasHandler
+	stateHandler     StateHandler
+	planModeHandler  PlanModeHandler
+	compactHandler   CompactHandler
 	accepts          *acceptRegistry
+	permissions      *permissionRegistry
 	allowedDirs      []string // /file allow-list (absolute, cleaned)
 
 	mu          sync.Mutex
@@ -267,10 +321,21 @@ func New(addr string, allowedDirs []string, h ChatHandler) *Server {
 	}
 	return &Server{
 		addr: addr, chatHandler: h, allowedDirs: clean,
-		subs:    make(map[chan Event]struct{}),
-		accepts: newAcceptRegistry(),
+		subs:        make(map[chan Event]struct{}),
+		accepts:     newAcceptRegistry(),
+		permissions: newPermissionRegistry(),
 	}
 }
+
+// SetStateHandler wires GET /api/state.
+func (s *Server) SetStateHandler(h StateHandler) { s.stateHandler = h }
+
+// SetPlanModeHandler wires POST /api/plan_mode. Same request/response
+// shape as kincode so KinClaw Mac's existing toggle drives both.
+func (s *Server) SetPlanModeHandler(h PlanModeHandler) { s.planModeHandler = h }
+
+// SetCompactHandler wires POST /api/compact.
+func (s *Server) SetCompactHandler(h CompactHandler) { s.compactHandler = h }
 
 // SetInterruptHandler wires the abort path. Optional — without it
 // DELETE /api/chat returns 501 and the UI's interrupt button fails
@@ -468,6 +533,10 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/api/skills/extras", s.handleSkillExtras)
 	mux.HandleFunc("/api/harvest/accept", s.handleAcceptStart)
 	mux.HandleFunc("/api/harvest/accept/status", s.handleAcceptStatus)
+	mux.HandleFunc("/api/state", s.handleState)
+	mux.HandleFunc("/api/plan_mode", s.handlePlanMode)
+	mux.HandleFunc("/api/compact", s.handleCompact)
+	mux.HandleFunc("/api/permission", s.handlePermission)
 	mux.HandleFunc("/api/screen/current.jpg", s.handleLiveScreen)
 	mux.HandleFunc("/api/screen/info", s.handleLiveScreenInfo)
 	mux.HandleFunc("/api/voice/transcribe", s.handleVoiceTranscribe)

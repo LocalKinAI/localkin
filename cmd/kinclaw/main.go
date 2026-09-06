@@ -17,14 +17,17 @@ import (
 	"github.com/LocalKinAI/kinclaw/pkg/applifecycle"
 	"github.com/LocalKinAI/kinclaw/pkg/auth"
 	"github.com/LocalKinAI/kinclaw/pkg/brain"
+	"github.com/LocalKinAI/kinclaw/pkg/compact"
+	"github.com/LocalKinAI/kinclaw/pkg/hooks"
 	"github.com/LocalKinAI/kinclaw/pkg/mcp"
 	"github.com/LocalKinAI/kinclaw/pkg/memory"
+	"github.com/LocalKinAI/kinclaw/pkg/permission"
 	"github.com/LocalKinAI/kinclaw/pkg/skill"
 	"github.com/LocalKinAI/kinclaw/pkg/soul"
 )
 
 const (
-	version = "1.15.0"
+	version = "1.18.0"
 	// maxToolRounds caps the tool-call sequence per user turn. 20 was
 	// fine for kernel-only flows but compound demos (record start + tts
 	// + multi-step ui find/click/verify + tts + record stop) easily
@@ -63,6 +66,46 @@ type session struct {
 	// from the spawn skill's goroutine, read under turnMu by chatHandler.
 	spawnMu      sync.Mutex
 	pendingSpawn []skill.SpawnResult
+
+	// gate decides allow / ask / deny per tool call (pkg/permission).
+	// Always non-nil; in auto mode it only enforces plan mode.
+	gate *permission.Gate
+	// hooks runs the soul's pre_tool / post_tool / stop commands. nil
+	// when the soul declares none.
+	hooks *hooks.Runner
+	// lastUsage is the provider-reported size of the most recent
+	// prompt — the number compaction trusts. totalIn / totalOut are
+	// the running sums for this process (/usage, /api/state).
+	lastUsage         brain.Usage
+	totalIn, totalOut int
+}
+
+// permissionModeFlag overrides the soul's permissions.mode when set
+// ("auto" for scripts driving an ask-mode soul, "ask" to gate a soul
+// that never opted in).
+var permissionModeFlag string
+
+// newGate builds the session's permission gate from the soul plus the
+// CLI override, attaching the terminal approver when a human can
+// answer. serve mode swaps in its own asker once the server exists.
+func newGate(s *soul.Soul) *permission.Gate {
+	mode := permission.Mode(s.Meta.Permissions.Mode)
+	if permissionModeFlag != "" {
+		mode = permission.Mode(permissionModeFlag)
+	}
+	var asker permission.Asker
+	if stdinIsTerminal() {
+		asker = cliAsker{}
+	}
+	return permission.New(mode, s.Meta.Permissions.Ask, s.Meta.Permissions.Allow, asker)
+}
+
+// newHooks builds the hook runner, or nil when the soul has none.
+func newHooks(s *soul.Soul) *hooks.Runner {
+	if s.Meta.Hooks.Empty() {
+		return nil
+	}
+	return hooks.New(s.Meta.Hooks, filepath.Dir(s.FilePath), s.Meta.Name, skill.SafeEnv())
 }
 
 func main() {
@@ -82,6 +125,9 @@ func main() {
 		case "serve":
 			runServe(os.Args[2:])
 			return
+		case "memory":
+			runMemory(os.Args[2:])
+			return
 		}
 	}
 
@@ -91,6 +137,7 @@ func main() {
 Usage:
   kinclaw -soul PATH [-exec MSG]    Run a soul (REPL or one-shot)
   kinclaw serve [-soul PATH]         Chat UI · 看着 5 爪干活 (split-pane in browser)
+  kinclaw memory [list|search|...]   See and curate what the agent remembers
   kinclaw harvest                    Pull external skill libraries; coder forges
                                      KinClaw versions of good ideas; stage for review
   kinclaw harvest --review           Show staged candidates
@@ -103,7 +150,7 @@ Top-level flags:
 `)
 		flag.PrintDefaults()
 		fmt.Fprintf(flag.CommandLine.Output(), `
-Subcommand help: kinclaw serve -h  /  kinclaw harvest -h  /  kinclaw probe -h
+Subcommand help: kinclaw serve -h  /  kinclaw memory -h  /  kinclaw harvest -h  /  kinclaw probe -h
 `)
 	}
 
@@ -113,7 +160,12 @@ Subcommand help: kinclaw serve -h  /  kinclaw harvest -h  /  kinclaw probe -h
 	showVersion := flag.Bool("version", false, "Show version")
 	login := flag.Bool("login", false, "Login with Claude OAuth (free tier)")
 	cleanup := flag.Bool("cleanup-apps", false, "On exit, quit any apps that weren't running when kinclaw started (leaves your pre-existing workspace alone)")
+	flag.StringVar(&permissionModeFlag, "permissions", "", "Override the soul's permissions.mode: auto | ask")
 	flag.Parse()
+	if permissionModeFlag != "" && permissionModeFlag != "auto" && permissionModeFlag != "ask" {
+		fmt.Fprintln(os.Stderr, "Error: -permissions must be auto or ask")
+		os.Exit(2)
+	}
 
 	if *showVersion {
 		fmt.Printf("kinclaw %s\n", version)
@@ -170,9 +222,10 @@ Subcommand help: kinclaw serve -h  /  kinclaw harvest -h  /  kinclaw probe -h
 	// MCP servers are subprocesses; they don't die with us unless told to.
 	defer sess.closeMCP()
 
-	fmt.Fprintf(os.Stderr, "\033[2m  LocalKin %s\n  Soul:     %s (%s)\n  Brain:    %s / %s\n  Skills:   %d loaded\033[0m\n\n",
+	fmt.Fprintf(os.Stderr, "\033[2m  LocalKin %s\n  Soul:     %s (%s)\n  Brain:    %s / %s\n  Skills:   %d loaded\n  Gate:     %s%s\033[0m\n\n",
 		version, sess.soul.Meta.Name, sess.soul.FilePath,
-		sess.soul.Meta.Brain.Provider, sess.soul.Meta.Brain.Model, len(sess.toolDefs))
+		sess.soul.Meta.Brain.Provider, sess.soul.Meta.Brain.Model, len(sess.toolDefs),
+		sess.gate.Mode(), gateSuffix(sess))
 
 	if *execMsg != "" {
 		os.Exit(runOnce(sess, *execMsg))
@@ -295,7 +348,27 @@ func newSession(soulPath string, debug bool, ephemeral bool) (*session, error) {
 		store:    store, id: sessionID, history: history,
 		debug: debug, soulPath: soulPath,
 		mcpClients: mcpClients, mcpResults: mcpResults, mcpConfig: mcpConfig,
+		gate:  newGate(s),
+		hooks: newHooks(s),
 	}, nil
+}
+
+// gateSuffix annotates the boot banner's Gate line.
+func gateSuffix(sess *session) string {
+	var parts []string
+	if sess.gate.Mode() == permission.ModeAsk && len(sess.soul.Meta.Permissions.Ask) == 0 {
+		parts = append(parts, "default ask set")
+	}
+	if sess.hooks != nil {
+		parts = append(parts, "hooks on")
+	}
+	if sess.soul.Meta.Context.Disabled {
+		parts = append(parts, "auto-compact off")
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(parts, ", ") + ")"
 }
 
 func buildRegistry(s *soul.Soul, store *memory.SQLiteStore) (*skill.Registry, []*mcp.Client, []mcp.LoadResult, *mcp.Config) {
@@ -479,13 +552,10 @@ func missingFromEnabled(enabled, registered []string) []string {
 }
 
 func runREPL(sess *session) {
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer cancel()
-
 	// Boot message: auto-execute if configured
 	if msg := sess.soul.Meta.Boot.Message; msg != "" {
 		fmt.Fprintf(os.Stderr, "\033[2m[boot] %s\033[0m\n", msg)
-		handleUserMessage(ctx, sess, msg)
+		handleUserMessage(sess, msg)
 	}
 
 	prompt := fmt.Sprintf("\033[1;36m%s>\033[0m ", sess.soul.Meta.Name)
@@ -499,18 +569,17 @@ func runREPL(sess *session) {
 			continue
 		}
 		if strings.HasPrefix(input, "/") {
-			if handleCommand(ctx, sess, input) {
+			if handleCommand(sess, input) {
 				return
 			}
 			continue
 		}
-		handleUserMessage(ctx, sess, input)
+		handleUserMessage(sess, input)
 	}
 }
 
 func runOnce(sess *session, input string) int {
-	ctx := context.Background()
-	handleUserMessage(ctx, sess, input)
+	handleUserMessage(sess, input)
 	if len(sess.history) > 0 {
 		last := sess.history[len(sess.history)-1]
 		if last.Role == brain.RoleAssistant && last.Content != "" {
@@ -520,173 +589,76 @@ func runOnce(sess *session, input string) int {
 	return 0
 }
 
-func handleUserMessage(ctx context.Context, sess *session, input string) {
-	userMsg := brain.Message{Role: brain.RoleUser, Content: input}
-	sess.history = append(sess.history, userMsg)
-	if sess.store != nil {
-		sess.store.SaveMessage(sess.id, userMsg)
+// turnContext gives each turn its own interrupt scope. Ctrl-C while the
+// brain or a tool is running cancels that turn and returns to the
+// prompt; the next turn starts with a fresh context. (One process-wide
+// NotifyContext used to be cancelled by the first Ctrl-C and stay
+// cancelled, so every later turn failed instantly with "context
+// canceled" until the REPL was restarted.)
+func turnContext() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), os.Interrupt)
+}
+
+// replSink prints a turn to the terminal.
+type replSink struct{ sess *session }
+
+func (r replSink) text(chunk string, thinking bool) {
+	if thinking {
+		fmt.Fprint(os.Stderr, "\033[2m"+chunk+"\033[0m")
+	} else {
+		fmt.Print(chunk)
 	}
+}
+func (r replSink) toolCall(id, name string, params map[string]string) {
+	if !r.sess.debug {
+		fmt.Fprintf(os.Stderr, "\033[2m  ⚙ %s\033[0m\n", permission.Summary(name, params))
+	}
+}
+func (r replSink) toolResult(res skill.ToolResult) {}
+func (r replSink) notice(msg string) {
+	fmt.Fprintf(os.Stderr, "\033[33m%s\033[0m\n", msg)
+}
+func (r replSink) usage(u brain.Usage, ctxLen int) {
+	if r.sess.debug && ctxLen > 0 {
+		fmt.Fprintf(os.Stderr, "\033[2m[usage: %d in / %d out — %d%% of %d context]\033[0m\n",
+			u.Total(), u.OutputTokens, u.Total()*100/ctxLen, ctxLen)
+	}
+}
+func (r replSink) compacted(res compact.Result) {
+	fmt.Fprintf(os.Stderr, "\033[2m[context compacted: %d messages folded, ~%d → ~%d tokens]\033[0m\n",
+		res.Summarized, res.BeforeTokens, res.AfterTokens)
+}
+
+func handleUserMessage(sess *session, input string) {
+	ctx, cancel := turnContext()
+	defer cancel()
 
 	// Pre-LLM grep route: if the soul opts in, try kinthink first.
 	// Hit path = ~50-100ms (grep + cerebellum exec), 0 LLM tokens.
-	// Miss path falls through to the LLM chatLoop unchanged. This is
-	// the operational core of paper #1+#11: most user intents map to
-	// a known cerebellum action, and grep finds the match fast.
+	// Miss path falls through to the LLM loop unchanged. This is the
+	// operational core of paper #1+#11: most user intents map to a
+	// known cerebellum action, and grep finds the match fast.
 	if sess.soul != nil && sess.soul.Meta.Cerebellum.GrepRoute {
 		if reply, ok := tryGrepRoute(sess, input); ok {
 			fmt.Print(reply)
 			if !strings.HasSuffix(reply, "\n") {
 				fmt.Println()
 			}
-			assistantMsg := brain.Message{Role: brain.RoleAssistant, Content: reply}
-			sess.history = append(sess.history, assistantMsg)
-			if sess.store != nil {
-				sess.store.SaveMessage(sess.id, assistantMsg)
-			}
+			sess.appendMessage(brain.Message{Role: brain.RoleUser, Content: input})
+			sess.appendMessage(brain.Message{Role: brain.RoleAssistant, Content: reply})
 			return
 		}
 	}
 
-	messages := buildMessages(sess.soul, sess.history)
-	onChunk := func(chunk string, thinking bool) error {
-		if thinking {
-			fmt.Fprint(os.Stderr, "\033[2m"+chunk+"\033[0m")
-		} else {
-			fmt.Print(chunk)
-		}
-		return nil
-	}
-
-	reply, toolHistory, err := chatLoop(ctx, sess, messages, onChunk)
+	_, err := runTurnCore(ctx, sess, input, replSink{sess})
 	fmt.Println()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\033[31mError: %v\033[0m\n", err)
-		// Persist the partial tool history + a synthesized abort note
-		// so the next user turn doesn't see back-to-back user messages
-		// (which the brain reads as "keep going on the prior task" and
-		// promptly reruns the failed loop). The note also gives the
-		// human something to react to: "continue" to resume or rephrase
-		// to start fresh.
-		for _, msg := range toolHistory {
-			if sess.store != nil {
-				sess.store.SaveMessage(sess.id, msg)
-			}
-			sess.history = append(sess.history, msg)
-		}
-		abortMsg := brain.Message{
-			Role:    brain.RoleAssistant,
-			Content: fmt.Sprintf("(Turn aborted: %v. Reply 'continue' to resume or rephrase to start fresh.)", err),
-		}
-		sess.history = append(sess.history, abortMsg)
-		if sess.store != nil {
-			sess.store.SaveMessage(sess.id, abortMsg)
-		}
-		return
+		// The abort note keeps the next user turn from reading as
+		// "keep going on the prior task" (back-to-back user messages)
+		// and gives the human something to react to.
+		sess.appendMessage(abortNote(err))
 	}
-
-	for _, msg := range toolHistory {
-		if sess.store != nil {
-			sess.store.SaveMessage(sess.id, msg)
-		}
-		sess.history = append(sess.history, msg)
-	}
-	assistantMsg := brain.Message{Role: brain.RoleAssistant, Content: reply}
-	sess.history = append(sess.history, assistantMsg)
-	if sess.store != nil {
-		sess.store.SaveMessage(sess.id, assistantMsg)
-	}
-
-	// Check if forge created new skills
-	for _, msg := range toolHistory {
-		if msg.Role == brain.RoleAssistant {
-			for _, tc := range msg.ToolCalls {
-				if tc.Function.Name == "forge" {
-					sess.toolDefs = sess.registry.FilteredToolDefs(effectiveEnable(sess.soul))
-					return
-				}
-			}
-		}
-	}
-}
-
-func chatLoop(ctx context.Context, sess *session, messages []brain.Message, onChunk brain.StreamFunc) (string, []brain.Message, error) {
-	var intermediateHistory []brain.Message
-	cb := skill.NewCircuitBreaker()
-
-	for round := 0; round < maxToolRounds; round++ {
-		result, err := sess.brain.Chat(ctx, messages, sess.toolDefs, onChunk)
-		if err != nil {
-			return "", nil, err
-		}
-		if len(result.ToolCalls) == 0 {
-			return result.Content, intermediateHistory, nil
-		}
-		assistantMsg := brain.Message{
-			Role: brain.RoleAssistant, Content: result.Content, ToolCalls: result.ToolCalls,
-		}
-		messages = append(messages, assistantMsg)
-		intermediateHistory = append(intermediateHistory, assistantMsg)
-
-		var callInfos []skill.ToolCallInfo
-		for _, tc := range result.ToolCalls {
-			params, err := tc.ParseArguments()
-			if err != nil {
-				toolMsg := brain.Message{Role: brain.RoleTool, Content: "Error: " + err.Error(), ToolCallID: tc.ID}
-				messages = append(messages, toolMsg)
-				intermediateHistory = append(intermediateHistory, toolMsg)
-				continue
-			}
-			if sess.debug {
-				fmt.Fprintf(os.Stderr, "\033[2m[tool: %s %v]\033[0m\n", tc.Function.Name, params)
-			}
-			callInfos = append(callInfos, skill.ToolCallInfo{ID: tc.ID, Name: tc.Function.Name, Params: params})
-		}
-
-		results := skill.ExecuteToolCalls(sess.registry, callInfos)
-
-		// Circuit breaker check
-		if tripped, tripMsg := cb.Record(results); tripped {
-			fmt.Fprintf(os.Stderr, "\033[33m%s\033[0m\n", tripMsg)
-			cbMsg := brain.Message{Role: brain.RoleUser, Content: tripMsg}
-			messages = append(messages, cbMsg)
-			intermediateHistory = append(intermediateHistory, cbMsg)
-		}
-
-		for _, r := range results {
-			if sess.debug {
-				display := r.Output
-				if len(display) > 200 {
-					display = display[:200] + "..."
-				}
-				fmt.Fprintf(os.Stderr, "\033[2m[%s -> %s]\033[0m\n", r.Name, strings.ReplaceAll(display, "\n", " "))
-			}
-			toolMsg := brain.Message{
-				Role:       brain.RoleTool,
-				Content:    r.Output,
-				ToolCallID: r.ToolCallID,
-				Images:     r.Images, // brain inlines image bytes for vision-capable models
-			}
-			messages = append(messages, toolMsg)
-			intermediateHistory = append(intermediateHistory, toolMsg)
-		}
-
-		// Cerebellum short-circuit: if the soul opts in via
-		// `cerebellum.exit_on_ok: true` and the round had a single
-		// tool call whose output's first non-empty line starts with
-		// "ok:", terminate the agent loop here rather than spending
-		// another LLM round trip on a "yes I'm done" confirmation.
-		// Designed for benchmarks / single-task one-shot runs where
-		// the cerebellum's `ok: …` line is itself a sufficient
-		// success signal.
-		if sess.soul != nil && sess.soul.Meta.Cerebellum.ExitOnOK &&
-			len(results) == 1 && isOkLine(results[0].Output) {
-			if sess.debug {
-				fmt.Fprintf(os.Stderr, "\033[2m[cerebellum.exit_on_ok: short-circuit after %s]\033[0m\n", results[0].Name)
-			}
-			return results[0].Output, intermediateHistory, nil
-		}
-	}
-	return "", intermediateHistory, fmt.Errorf("too many tool call rounds (max %d)", maxToolRounds)
 }
 
 // tryGrepRoute runs the kinthink router (a small shell script) against
@@ -705,11 +677,18 @@ func chatLoop(ctx context.Context, sess *session, messages []brain.Message, onCh
 func tryGrepRoute(sess *session, prompt string) (string, bool) {
 	script := sess.soul.Meta.Cerebellum.GrepRouteScript
 	if script == "" {
-		// Default location: alongside the kinclaw soul or in the
-		// shipped skills tree. Look in a few obvious places.
+		// Default location: the kinthink skill dir, wherever skills
+		// were loaded from — next to the soul's repo, ~/.localkin/
+		// skills, $KINCLAW_SKILL_DIRS. Same search order as boot.
 		candidates := []string{
 			filepath.Join(filepath.Dir(sess.soulPath), "..", "skills", "kinthink", "kinthink.sh"),
-			"/Users/jackysun/Documents/Workspace/kinclaw/skills/kinthink/kinthink.sh",
+		}
+		skillsDir := "./skills"
+		if sess.soul.Meta.Skills.Dir != "" {
+			skillsDir = sess.soul.Meta.Skills.Dir
+		}
+		for _, d := range skillSearchDirs(skillsDir) {
+			candidates = append(candidates, filepath.Join(d, "kinthink", "kinthink.sh"))
 		}
 		for _, c := range candidates {
 			if abs, err := filepath.Abs(c); err == nil {
@@ -755,6 +734,19 @@ func tryGrepRoute(sess *session, prompt string) (string, bool) {
 		}
 		return "", false
 	}
+	// A match that didn't *finish* is not an answer. The router can
+	// score a free-form prompt above threshold, fill zero slots, and
+	// run a cerebellum action that fails with "ERR: missing argument"
+	// — observed with "用 shell 执行 echo …" landing on
+	// terminal-create-file. Cerebellum success is always an "ok:" line;
+	// anything else goes to the LLM, which is what would have happened
+	// without the router.
+	if !isOkLine(output) {
+		if sess.debug {
+			fmt.Fprintln(os.Stderr, "\033[2m[grep_route: matched but execution did not report ok: — falling through to LLM]\033[0m")
+		}
+		return "", false
+	}
 	return output, true
 }
 
@@ -784,7 +776,7 @@ func isOkLine(out string) bool {
 // ─── Commands ─────────────────────────────────────────────
 
 // handleCommand processes slash commands. Returns true if REPL should exit.
-func handleCommand(ctx context.Context, sess *session, input string) bool {
+func handleCommand(sess *session, input string) bool {
 	parts := strings.Fields(input)
 	cmd := parts[0]
 	arg := ""
@@ -799,13 +791,72 @@ func handleCommand(ctx context.Context, sess *session, input string) bool {
 
 	case "/help":
 		fmt.Print("\033[2m" +
-			"/quit      Exit\n" +
-			"/skills    List available skills\n" +
-			"/clear     Clear conversation history\n" +
-			"/info      Show soul, model, and token stats\n" +
-			"/reload    Reload current soul file\n" +
-			"/soul      List or switch soul files\n" +
+			"/quit          Exit\n" +
+			"/skills        List available skills\n" +
+			"/clear         Start a new session (old one archived, not deleted)\n" +
+			"/info          Show soul, model, and context stats\n" +
+			"/usage         Token totals for this process\n" +
+			"/compact       Fold older conversation into a summary now\n" +
+			"/plan [on|off] Toggle plan mode (read-only tools until you approve)\n" +
+			"/permissions   Show the gate: mode, rules, session approvals\n" +
+			"/permissions allow <skill>   Approve a skill for the rest of this session\n" +
+			"/memory        What the agent remembers (also: kinclaw memory)\n" +
+			"/reload        Reload current soul file\n" +
+			"/soul          List or switch soul files\n" +
 			"\033[0m")
+
+	case "/usage":
+		ctxLen := sess.soul.Meta.Brain.ContextLength
+		pct := 0
+		if ctxLen > 0 {
+			pct = sess.lastUsage.Total() * 100 / ctxLen
+		}
+		fmt.Printf("\033[2m  Last prompt:  %d tokens (%d%% of %d)\n  This process: %d in / %d out\n  History:      %d messages\033[0m\n",
+			sess.lastUsage.Total(), pct, ctxLen, sess.totalIn, sess.totalOut, len(sess.history))
+
+	case "/compact":
+		ctx, cancel := turnContext()
+		res, err := compactNow(ctx, sess)
+		cancel()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "\033[31m%v\033[0m\n", err)
+			break
+		}
+		fmt.Printf("\033[2mCompacted: %d messages folded, %d kept, ~%d → ~%d tokens\033[0m\n",
+			res.Summarized, res.Kept, res.BeforeTokens, res.AfterTokens)
+		fmt.Println(res.Summary)
+
+	case "/plan":
+		switch strings.ToLower(arg) {
+		case "on":
+			sess.gate.SetPlanMode(true)
+		case "off":
+			sess.gate.SetPlanMode(false)
+		default:
+			sess.gate.SetPlanMode(!sess.gate.PlanMode())
+		}
+		if sess.gate.PlanMode() {
+			fmt.Println("\033[2mPlan mode ON — the agent can look but not act until you turn it off.\033[0m")
+		} else {
+			fmt.Println("\033[2mPlan mode OFF.\033[0m")
+		}
+
+	case "/permissions":
+		if strings.HasPrefix(arg, "allow ") {
+			name := strings.TrimSpace(strings.TrimPrefix(arg, "allow "))
+			sess.gate.AllowSession(name)
+			fmt.Printf("\033[2m%s approved for this session.\033[0m\n", name)
+			break
+		}
+		p := sess.soul.Meta.Permissions
+		fmt.Printf("\033[2m  Mode:     %s\n  Plan:     %v\n  Ask:      %s\n  Allow:    %s\n  Session:  %s\033[0m\n",
+			sess.gate.Mode(), sess.gate.PlanMode(),
+			orNone(strings.Join(p.Ask, ", "), "(default set: shell, file_write, file_edit, forge, mcp_*)"),
+			orNone(strings.Join(p.Allow, ", "), "-"),
+			orNone(strings.Join(sess.gate.SessionAllowed(), ", "), "-"))
+
+	case "/memory":
+		runMemory(nil)
 
 	case "/skills":
 		for _, def := range sess.toolDefs {
@@ -820,20 +871,34 @@ func handleCommand(ctx context.Context, sess *session, input string) bool {
 		}
 
 	case "/clear":
+		archived := ""
+		if sess.store != nil && len(sess.history) > 0 {
+			if key, n, err := sess.store.ArchiveSession(sess.id); err == nil && n > 0 {
+				archived = fmt.Sprintf(" (%d messages archived as %q)", n, key)
+			}
+		}
 		sess.history = nil
-		fmt.Println("\033[2mConversation cleared.\033[0m")
+		sess.lastUsage = brain.Usage{}
+		fmt.Printf("\033[2mNew session%s.\033[0m\n", archived)
 
 	case "/info":
-		tokens := estimateTokens(sess.history)
+		tokens := sess.lastUsage.Total()
+		src := "provider-reported"
+		if tokens == 0 {
+			tokens = brain.EstimateText(sess.soul.SystemPrompt) + brain.EstimateTokens(sess.history)
+			src = "estimated"
+		}
 		fmt.Printf("\033[2m"+
 			"  Version:  %s\n"+
 			"  Soul:     %s (%s)\n"+
-			"  Brain:    %s / %s\n"+
+			"  Brain:    %s / %s (%d context)\n"+
 			"  Skills:   %d loaded\n"+
-			"  History:  %d messages (~%d tokens)\n"+
+			"  Gate:     %s, plan=%v\n"+
+			"  History:  %d messages, prompt ~%d tokens (%s)\n"+
 			"\033[0m", version, sess.soul.Meta.Name, sess.soul.FilePath,
-			sess.soul.Meta.Brain.Provider, sess.soul.Meta.Brain.Model,
-			len(sess.toolDefs), len(sess.history), tokens)
+			sess.soul.Meta.Brain.Provider, sess.soul.Meta.Brain.Model, sess.soul.Meta.Brain.ContextLength,
+			len(sess.toolDefs), sess.gate.Mode(), sess.gate.PlanMode(),
+			len(sess.history), tokens, src)
 
 	case "/reload":
 		s, err := soul.LoadSoul(sess.soulPath)
@@ -845,6 +910,8 @@ func handleCommand(ctx context.Context, sess *session, input string) bool {
 		sess.id = s.Meta.Name // keep in sync — soul rename would otherwise misroute saves
 		sess.swapRegistry(buildRegistry(s, sess.store))
 		sess.toolDefs = sess.registry.FilteredToolDefs(effectiveEnable(s))
+		sess.gate = newGate(s)
+		sess.hooks = newHooks(s)
 		fmt.Printf("\033[2mReloaded %s (%d skills)\033[0m\n", s.Meta.Name, len(sess.toolDefs))
 
 	case "/soul":
@@ -866,6 +933,9 @@ func handleCommand(ctx context.Context, sess *session, input string) bool {
 			sess.id = s.Meta.Name // route saves under the new soul's bucket
 			sess.swapRegistry(buildRegistry(s, sess.store))
 			sess.toolDefs = sess.registry.FilteredToolDefs(effectiveEnable(s))
+			sess.gate = newGate(s)
+			sess.hooks = newHooks(s)
+			sess.lastUsage = brain.Usage{}
 			// Load the new soul's prior history — switching is opting
 			// into that soul's accumulated memory, not starting fresh.
 			// /reset is the path for "wipe and start over."
@@ -886,9 +956,11 @@ func handleCommand(ctx context.Context, sess *session, input string) bool {
 
 // ─── Helpers ──────────────────────────────────────────────
 
-func buildMessages(s *soul.Soul, history []brain.Message) []brain.Message {
-	messages := []brain.Message{{Role: brain.RoleSystem, Content: s.SystemPrompt}}
-	return append(messages, history...)
+func orNone(s, fallback string) string {
+	if strings.TrimSpace(s) == "" {
+		return fallback
+	}
+	return s
 }
 
 func findSoulFile(explicit string) string {
@@ -1026,14 +1098,6 @@ func loadOAuthToken() string {
 		return ""
 	}
 	return a.AccessToken
-}
-
-func estimateTokens(messages []brain.Message) int {
-	total := 0
-	for _, m := range messages {
-		total += len(strings.Fields(m.Content))
-	}
-	return int(float64(total) * 1.3)
 }
 
 func truncate(s string, max int) string {

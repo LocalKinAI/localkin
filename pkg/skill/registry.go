@@ -201,41 +201,80 @@ func extractImageMarkers(out string) (cleaned string, images []string) {
 	return strings.TrimRight(strings.Join(keep, "\n"), "\n"), images
 }
 
+// exclusiveSkills must never run concurrently with another call in the
+// same round. They share one physical resource — the user's screen,
+// keyboard, clipboard, foreground app — or mutate the same tree of
+// files. Two `input` calls racing produce interleaved keystrokes; a
+// `ui click` racing a `screen screenshot` captures a half-transitioned
+// window; two `file_edit`s on one file clobber each other. Read-only
+// and network skills (web_search × 8, kinbrain, memory, spawn) stay
+// parallel — that fan-out is what makes researcher fast.
+var exclusiveSkills = map[string]bool{
+	"screen": true, "ui": true, "input": true, "record": true, "smart_click": true,
+	"cerebellum": true, "kinthink": true, "app_open_clean": true, "tts": true, "stt": true,
+	"shell": true, "file_write": true, "file_edit": true, "forge": true,
+}
+
+// exclusivePrefixes catches app-driving SKILL.md families by name.
+var exclusivePrefixes = []string{"notes_", "music_", "imsg_", "mail_"}
+
+// ParallelSafe reports whether a skill may run alongside others in the
+// same round. Unknown skills are assumed safe — that was the behaviour
+// before this check existed and external skills were designed for it.
+func ParallelSafe(name string) bool {
+	if exclusiveSkills[name] {
+		return false
+	}
+	for _, p := range exclusivePrefixes {
+		if strings.HasPrefix(name, p) {
+			return false
+		}
+	}
+	return true
+}
+
+func executeOne(reg *Registry, c ToolCallInfo) ToolResult {
+	s, err := reg.Get(c.Name)
+	if err != nil {
+		return ToolResult{ToolCallID: c.ID, Name: c.Name, Output: err.Error(), Err: err}
+	}
+	out, err := s.Execute(c.Params)
+	if err != nil {
+		return ToolResult{ToolCallID: c.ID, Name: c.Name, Output: fmt.Sprintf("Error: %v", err), Err: err}
+	}
+	cleaned, imgs := extractImageMarkers(out)
+	return ToolResult{ToolCallID: c.ID, Name: c.Name, Output: cleaned, Images: imgs}
+}
+
+// ExecuteToolCalls runs a round's calls and returns results in call
+// order. Calls run concurrently only when every one of them is
+// ParallelSafe; a single exclusive skill in the batch serializes the
+// whole round in the order the model emitted it, which is the order
+// the model meant.
 func ExecuteToolCalls(reg *Registry, calls []ToolCallInfo) []ToolResult {
 	if len(calls) == 0 {
 		return nil
 	}
-	if len(calls) == 1 {
-		c := calls[0]
-		s, err := reg.Get(c.Name)
-		if err != nil {
-			return []ToolResult{{ToolCallID: c.ID, Name: c.Name, Output: err.Error(), Err: err}}
-		}
-		out, err := s.Execute(c.Params)
-		if err != nil {
-			return []ToolResult{{ToolCallID: c.ID, Name: c.Name, Output: fmt.Sprintf("Error: %v", err), Err: err}}
-		}
-		cleaned, imgs := extractImageMarkers(out)
-		return []ToolResult{{ToolCallID: c.ID, Name: c.Name, Output: cleaned, Images: imgs}}
-	}
 	results := make([]ToolResult, len(calls))
+	parallel := len(calls) > 1
+	for _, c := range calls {
+		if !ParallelSafe(c.Name) {
+			parallel = false
+			break
+		}
+	}
+	if !parallel {
+		for i, c := range calls {
+			results[i] = executeOne(reg, c)
+		}
+		return results
+	}
 	var wg sync.WaitGroup
 	for i, c := range calls {
 		wg.Add(1)
 		go func(idx int, ci ToolCallInfo) {
 			defer wg.Done()
-			s, err := reg.Get(ci.Name)
-			if err != nil {
-				results[idx] = ToolResult{ToolCallID: ci.ID, Name: ci.Name, Output: err.Error(), Err: err}
-				return
-			}
-			out, err := s.Execute(ci.Params)
-			if err != nil {
-				results[idx] = ToolResult{ToolCallID: ci.ID, Name: ci.Name, Output: fmt.Sprintf("Error: %v", err), Err: err}
-				return
-			}
-			cleaned, imgs := extractImageMarkers(out)
-			results[idx] = ToolResult{ToolCallID: ci.ID, Name: ci.Name, Output: cleaned, Images: imgs}
+			results[idx] = executeOne(reg, ci)
 		}(i, c)
 	}
 	wg.Wait()

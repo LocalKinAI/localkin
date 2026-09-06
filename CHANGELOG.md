@@ -1,5 +1,231 @@
 # Changelog
 
+## [Unreleased] - 2026-09-05 — v1.18.0: the kernel learns from Claude Code
+
+The theme: kinclaw already had the claws; what it lacked were the
+*harness* habits that make Claude Code and Claude Desktop trustworthy
+for hours at a time — a permission gate the harness enforces, context
+that doesn't overflow, hooks for deterministic rules, a place for the
+user's standing instructions, and a way to see what the agent remembers.
+Every piece below is opt-in or backward compatible; souls that don't
+mention the new fields behave exactly as before.
+
+### Added — permission gate (`permissions.mode: ask`)
+
+A deterministic allow / ask / deny decision *between* "the model wants
+to run this" and "it runs", made by the kernel, not by the soul's good
+intentions. `pkg/permission`.
+
+```yaml
+permissions:
+  mode: ask                      # default stays "auto" — nothing changes for existing souls
+  ask:   ["shell", "file_write", "file_edit", "forge", "mcp_*", "ui(click*)"]
+  allow: ["shell(git status*)", "shell(ls*)", "file_write(~/.kinclaw*)"]
+```
+
+- Rule grammar: a skill name, a `prefix*`, or `skill(param-prefix*)`
+  matched against the skill's primary parameter (shell → command,
+  ui/input/screen → action, file_* → path with `~` expanded, cerebellum
+  → cmd). `allow` is checked before `ask`.
+- Empty `ask` in ask mode means the default set — shell, file writes,
+  forge, MCP tools. GUI claws are deliberately *not* in it: in Cowork
+  the clicking is the work, and a prompt per click makes the agent
+  useless. Souls that want it add `ui(click*)` / `input`.
+- Shell commands that look irreversible (`rm -r`, `sudo`, `git push`,
+  `kill`, `launchctl bootout`, `defaults write`, `diskutil erase`,
+  `curl … | sh`, …) always ask in ask mode unless an allow rule covers
+  them.
+- Answers: allow once, **always this session**, deny. A denial becomes
+  the tool result ("Permission denied by the user … do not retry the
+  same call") so the model adapts instead of looping.
+- REPL: a terminal prompt. `kinclaw serve`: a `permission_request` SSE
+  event and `POST /api/permission {id, decision}`; the turn parks for
+  up to 10 minutes, and Stop cancels the wait. `-exec` with no
+  terminal: denied with the exact allow rule to add. `-permissions
+  auto|ask` overrides the soul for scripts.
+- `/permissions` shows the gate; `/permissions allow <skill>` approves
+  for the session.
+
+### Added — plan mode
+
+`/plan` in the REPL, `POST /api/plan_mode {enabled}` in serve (same
+shape as kincode, so KinClaw Mac's toggle drives both). While on, only
+observation goes through — screenshot/ocr, ui tree/find/read/watch,
+file_read, web, kinbrain, memory, todo_write — and every refused call
+tells the model to finish investigating and end with a numbered plan.
+Per-action: `ui tree` is allowed, `ui click` is not.
+
+### Added — context compaction (`pkg/compact`)
+
+A menubar agent runs for days; history only grew. Now, when the
+provider-reported prompt size crosses `context.compact_at` (default
+0.75) of `brain.context_length`, the kernel folds everything but the
+last `context.keep_recent` (default 8) messages into a dense summary
+written by the model — goals, what was done, every path / URL / bundle
+id verbatim, current todo state, open issues — and continues. The split
+always lands on a user turn so no tool call is separated from its
+result. `/compact` and `POST /api/compact` fold on demand; a
+`compacted` SSE event carries the summary. The pre-fold rows are
+archived, never deleted.
+
+### Added — token accounting
+
+`brain.ChatResult.Usage` is populated from Anthropic (`message_start` /
+`message_delta`) and OpenAI-compatible streams (`stream_options:
+{include_usage: true}`, which Ollama, Groq and DeepSeek honour). The
+kernel emits a `usage` SSE event after every model call with
+`context_length`, `/usage` shows totals, `/info` reports the real
+prompt size. Fallback estimation is CJK-aware: the old words×1.3
+heuristic undercounted Chinese by an order of magnitude because there
+are no spaces to split on.
+
+### Added — prompt caching for Claude
+
+Against api.anthropic.com the system prompt and the tools array carry
+`cache_control: ephemeral`. A pilot turn re-sends the same 30KB soul +
+25 tool schemas on every round; caching turns that into a cache read.
+Gated to anthropic.com because Anthropic-format proxies don't all
+accept the marker.
+
+### Added — hooks (`pkg/hooks`)
+
+```yaml
+hooks:
+  pre_tool:
+    - match: "input"                     # skill name or prefix*; empty = all
+      run: "./hooks/no-typing-while-zoom.sh"
+  post_tool:
+    - match: "shell"
+      run: "tee -a ~/.kinclaw/shell.log >/dev/null"
+  stop:
+    - run: "afplay /System/Library/Sounds/Glass.aiff"
+```
+
+User shell commands at fixed points of the loop, JSON payload on stdin,
+Claude Code's exit-code protocol: 0 continue, 2 block (pre_tool: the
+call never runs and the hook's stderr is the tool result; post_tool:
+stderr is appended as feedback), anything else logged and ignored so a
+broken hook degrades the agent rather than disabling it. 10s timeout.
+Relative paths resolve next to the soul.
+
+### Added — `KINCLAW.md` standing instructions
+
+`~/.kinclaw/KINCLAW.md` (global) and `./KINCLAW.md` (per directory) are
+appended to the system prompt — the CLAUDE.md idea. Souls are shared
+identity; this is one person's house rules.
+
+### Added — `kinclaw memory`
+
+```
+kinclaw memory                 overview: facts, notebook topics, sessions
+kinclaw memory list [-all]     durable facts (memories table)
+kinclaw memory search <q>      facts + conversation history + notebook
+kinclaw memory forget <key>
+kinclaw memory learned [topic] the notebook, or one ## section
+kinclaw memory sessions        live + archived buckets
+kinclaw memory paths
+```
+
+Memory was write-mostly; the only way to see or fix it was sqlite3 and
+a text editor. A memory you can't inspect is a memory you can't trust.
+
+### Added — notebook progressive disclosure
+
+When `learned.md` outgrows its 8KB prompt budget the model now sees a
+**topic index** (every `## section` with its bullet count) plus the
+newest tail, instead of silently losing its oldest lessons to a tail
+cut. `learn action=list` prints the index, `learn action=recall
+topic=X` reads one section.
+
+### Changed — tool results are capped and spilled
+
+One result contributes at most 24KB to the context; the rest is written
+to `~/.kinclaw/tool-results/<time>-<call-id>.txt` and the result ends
+with the path ("use file_read only if you need the rest"). Spilled
+files are pruned after 7 days.
+
+### Changed — GUI claws no longer race each other
+
+A round with several tool calls used to run them all concurrently. Two
+`input` calls interleave keystrokes; `ui click` racing `screen
+screenshot` captures a half-transitioned window. A round runs in
+parallel only when every call is parallel-safe (web, kinbrain, memory,
+spawn, MCP …); one exclusive skill (screen / ui / input / record /
+cerebellum / shell / file writes / notes_* …) serializes the round in
+the order the model emitted it.
+
+### Changed — "New session" archives instead of deleting
+
+`POST /api/session/reset` and `/clear` move the rows to
+`"<soul>@<timestamp>"` rather than `DELETE`ing them. Still searchable
+with `memory action=recall scope=history`, listed by `kinclaw memory
+sessions`.
+
+### Changed — one turn loop, two front-ends
+
+`chatLoop` (REPL) and `runTurn` (serve) were hand-mirrored copies. With
+gate + hooks + spill + usage + compaction to thread through both, they
+became `runTurnCore` in `cmd/kinclaw/turn.go` driven through a
+six-method sink (`replSink`, `sseSink`). Messages are now persisted as
+they happen in both modes, so an interrupted turn leaves the store
+consistent.
+
+### Changed — circuit-breaker trips are `notice` events, not `error`
+
+Every client treated `error` as "the turn is over" — KinClaw Mac stops
+reading the stream on it — so a mid-turn `[SYSTEM]` warning silently
+truncated the rest of the turn in the UI. Kernel commentary (breaker
+trips, hook blocks, permission denials) now goes out as `notice`.
+
+### Fixed — `learn` wrote a file the kernel never read
+
+Since the v1.10 storage split the `learn` skill appended to
+`~/.localkin/learned.md` while the kernel injected `~/.kinclaw/
+learned.md`. Every lesson recorded since May was invisible to the next
+session. The skill now writes the canonical path; the kernel reads both
+files (deduplicated) so nothing already written is lost.
+
+### Fixed — resumed sessions could start with a 400
+
+`LoadHistory` takes the most recent 50 rows, which can begin in the
+middle of a tool group — a `tool_result` whose `tool_use` is row 51.
+Anthropic and OpenAI-compatible servers both reject that, on the very
+first call after a restart, until "New session" cleared it. History is
+now sanitized on load (`brain.SanitizeHistory`): orphan results and
+unanswered calls are dropped, the window opens on a user turn.
+
+### Fixed — Ctrl-C killed every later turn in the REPL
+
+One process-wide `signal.NotifyContext` was cancelled by the first
+Ctrl-C and stayed cancelled; every subsequent turn failed instantly
+with "context canceled". Each turn now gets its own interrupt scope.
+
+### Fixed — grep route returned failures as answers
+
+kinthink could score a free-form prompt above threshold, fill zero
+slots, run a cerebellum action that failed with `ERR: missing
+argument`, and exit 0 — so the user got the error text as the reply and
+the LLM never ran. kinthink.sh now exits with the cerebellum's code and
+the kernel only accepts a routed result that contains an `ok:` line.
+
+### Fixed — hardcoded developer paths
+
+`skills/cerebellum/SKILL.md` invoked `/Users/jackysun/…/cerebellum.sh`
+(now `$SKILL_DIR/cerebellum.sh`); `tryGrepRoute` fell back to the same
+absolute path (now the skill search dirs). Also: the `-version` string
+had been stuck at 1.15.0 since v1.16.
+
+### API surface for shells
+
+New SSE events: `permission_request` {id, name, params, summary,
+reason}, `permission_resolved`, `usage` {input_tokens, output_tokens,
+context_length}, `compacted` {before_tokens, after_tokens, message,
+output}, `notice` {message}, `plan_mode` {plan_mode}. New endpoints:
+`GET /api/state`, `POST /api/permission`, `POST /api/plan_mode`, `POST
+/api/compact`. `hello` params gain `mode`.
+
+---
+
 ## [Unreleased] - 2026-08-26 — MCP servers, harvest that finishes, and a session bug behind both
 
 ### Added — Model Context Protocol client

@@ -18,8 +18,14 @@ const (
 	RoleTool      = "tool"
 )
 
+// retryDo retries 429 / 5xx responses with exponential backoff (2, 4,
+// 8, 16s — ~30s total), honouring Retry-After when the server sends
+// one, and stops early if the request's context is cancelled. Cloud
+// providers rate-limit in bursts; three attempts one second apart
+// (the old policy) gave up before the burst was over, and an
+// interactive agent would rather wait half a minute than fail a turn.
 func retryDo(client *http.Client, newReq func() (*http.Request, error)) (*http.Response, error) {
-	const maxAttempts = 3
+	const maxAttempts = 5
 	var resp *http.Response
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		req, err := newReq()
@@ -33,12 +39,39 @@ func retryDo(client *http.Client, newReq func() (*http.Request, error)) (*http.R
 		if resp.StatusCode != 429 && resp.StatusCode < 500 {
 			return resp, nil
 		}
+		if attempt == maxAttempts-1 {
+			return resp, nil
+		}
+		wait := time.Duration(2<<attempt) * time.Second
+		if ra, ok := retryAfter(resp); ok {
+			wait = ra
+		}
+		if wait > 30*time.Second {
+			wait = 30 * time.Second
+		}
 		resp.Body.Close()
-		if attempt < maxAttempts-1 {
-			time.Sleep(time.Duration(1<<attempt) * time.Second)
+		select {
+		case <-time.After(wait):
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
 		}
 	}
 	return resp, nil
+}
+
+// retryAfter parses a Retry-After header given in seconds ("0" is a
+// valid answer: retry now). Dates are ignored (rare from LLM providers)
+// and fall back to the backoff.
+func retryAfter(resp *http.Response) (time.Duration, bool) {
+	v := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if v == "" {
+		return 0, false
+	}
+	var secs int
+	if _, err := fmt.Sscanf(v, "%d", &secs); err != nil || secs < 0 {
+		return 0, false
+	}
+	return time.Duration(secs) * time.Second, true
 }
 
 type Message struct {
@@ -105,9 +138,29 @@ func (tc ToolCall) ParseArguments() (map[string]string, error) {
 	return out, nil
 }
 
+// Usage is the provider-reported token accounting for one Chat call.
+// InputTokens is the whole prompt the model actually saw (system +
+// tools + every message), which makes it the one honest measure of
+// how full the context window is — the kernel's compaction trigger
+// reads it in preference to any client-side estimate. Cache fields
+// are Anthropic-only (prompt caching); zero elsewhere.
+type Usage struct {
+	InputTokens      int
+	OutputTokens     int
+	CacheReadTokens  int
+	CacheWriteTokens int
+}
+
+// Total is the prompt size including cached tokens — cache reads are
+// still tokens in the window, they are just billed differently.
+func (u Usage) Total() int { return u.InputTokens + u.CacheReadTokens + u.CacheWriteTokens }
+
 type ChatResult struct {
 	Content   string
 	ToolCalls []ToolCall
+	// Usage is zero when the provider didn't report it (some
+	// OpenAI-compatible servers omit it on streams).
+	Usage Usage
 }
 
 type StreamFunc func(chunk string, thinking bool) error
@@ -134,14 +187,44 @@ func NewClaudeBrain(endpoint, model, apiKey string, temperature float64) Brain {
 }
 
 type cReq struct {
-	Model       string            `json:"model"`
-	MaxTokens   int               `json:"max_tokens"`
-	Temperature float64           `json:"temperature,omitempty"`
-	System      string            `json:"system,omitempty"`
-	Messages    []cMsg            `json:"messages"`
-	Stream      bool              `json:"stream"`
-	Tools       []json.RawMessage `json:"tools,omitempty"`
+	Model       string  `json:"model"`
+	MaxTokens   int     `json:"max_tokens"`
+	Temperature float64 `json:"temperature,omitempty"`
+	// System is a plain string normally, or an array of text blocks
+	// when prompt caching is on (the cache_control marker lives on a
+	// block, not on the string form).
+	System   interface{}       `json:"system,omitempty"`
+	Messages []cMsg            `json:"messages"`
+	Stream   bool              `json:"stream"`
+	Tools    []json.RawMessage `json:"tools,omitempty"`
 }
+
+// cUsage mirrors the `usage` object on both the non-streaming
+// response and the message_start / message_delta stream events.
+type cUsage struct {
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+}
+
+func (u *cUsage) toUsage() Usage {
+	if u == nil {
+		return Usage{}
+	}
+	return Usage{
+		InputTokens: u.InputTokens, OutputTokens: u.OutputTokens,
+		CacheReadTokens: u.CacheReadInputTokens, CacheWriteTokens: u.CacheCreationInputTokens,
+	}
+}
+
+// cacheControl is Anthropic's prompt-caching marker. Put on the system
+// block and the last tool definition, it lets the API reuse the
+// (large, stable) prefix across the dozens of calls one agent turn
+// makes — the soul + skills are identical from round to round, only
+// the messages tail grows. Same trick Claude Code relies on.
+var cacheControl = map[string]string{"type": "ephemeral"}
+
 type cMsg struct {
 	Role    string      `json:"role"`
 	Content interface{} `json:"content"`
@@ -172,6 +255,7 @@ type cImageSource struct {
 }
 type cResp struct {
 	Content []cBlock `json:"content"`
+	Usage   *cUsage  `json:"usage,omitempty"`
 	Error   *struct {
 		Message string `json:"message"`
 	} `json:"error"`
@@ -181,7 +265,13 @@ type cStreamEvent struct {
 	Index        int     `json:"index,omitempty"`
 	Delta        *cDelta `json:"delta,omitempty"`
 	ContentBlock *cBlock `json:"content_block,omitempty"`
-	Error        *struct {
+	// message_start carries the prompt-side usage (input + cache);
+	// message_delta carries the cumulative output_tokens.
+	Message *struct {
+		Usage *cUsage `json:"usage,omitempty"`
+	} `json:"message,omitempty"`
+	Usage *cUsage `json:"usage,omitempty"`
+	Error *struct {
 		Message string `json:"message"`
 	} `json:"error,omitempty"`
 }
@@ -248,9 +338,24 @@ func (b *claudeBrain) Chat(ctx context.Context, messages []Message, tools []json
 		}
 	}
 	claudeTools := convertToolsToClaude(tools)
+	// Prompt caching only against Anthropic itself. Anthropic-format
+	// proxies and third-party endpoints don't all accept cache_control,
+	// and a 400 on every call is a worse failure than a cache miss.
+	var system interface{} = systemPrompt
+	if b.promptCaching() {
+		if systemPrompt != "" {
+			system = []map[string]interface{}{{
+				"type": "text", "text": systemPrompt, "cache_control": cacheControl,
+			}}
+		}
+		claudeTools = markLastToolCacheable(claudeTools)
+	}
+	if systemPrompt == "" {
+		system = nil
+	}
 	reqBody := cReq{
 		Model: b.model, MaxTokens: b.maxTokens, Temperature: b.temperature,
-		System: systemPrompt, Messages: convMsgs, Stream: onChunk != nil, Tools: claudeTools,
+		System: system, Messages: convMsgs, Stream: onChunk != nil, Tools: claudeTools,
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -288,7 +393,7 @@ func (b *claudeBrain) Chat(ctx context.Context, messages []Message, tools []json
 		if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
 			return nil, fmt.Errorf("decoding response: %w", err)
 		}
-		result := &ChatResult{}
+		result := &ChatResult{Usage: chatResp.Usage.toUsage()}
 		var textParts []string
 		for _, block := range chatResp.Content {
 			switch block.Type {
@@ -310,12 +415,17 @@ func (b *claudeBrain) Chat(ctx context.Context, messages []Message, tools []json
 	}
 	var full strings.Builder
 	var streamToolCalls []ToolCall
+	var usage Usage
 	type toolBlock struct {
 		id, name  string
 		inputJSON strings.Builder
 	}
 	activeTools := make(map[int]*toolBlock)
 	scanner := bufio.NewScanner(resp.Body)
+	// Tool inputs and long text deltas can exceed bufio's 64KB default
+	// line limit; a single oversized SSE line would otherwise end the
+	// scan early and silently truncate the reply.
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
@@ -330,9 +440,19 @@ func (b *claudeBrain) Chat(ctx context.Context, messages []Message, tools []json
 			continue
 		}
 		if event.Error != nil {
-			return &ChatResult{Content: full.String()}, fmt.Errorf("Claude stream error: %s", event.Error.Message)
+			return &ChatResult{Content: full.String(), Usage: usage}, fmt.Errorf("Claude stream error: %s", event.Error.Message)
 		}
 		switch event.Type {
+		case "message_start":
+			if event.Message != nil && event.Message.Usage != nil {
+				u := event.Message.Usage.toUsage()
+				usage.InputTokens, usage.CacheReadTokens, usage.CacheWriteTokens =
+					u.InputTokens, u.CacheReadTokens, u.CacheWriteTokens
+			}
+		case "message_delta":
+			if event.Usage != nil {
+				usage.OutputTokens = event.Usage.OutputTokens
+			}
 		case "content_block_start":
 			if event.ContentBlock != nil && event.ContentBlock.Type == "tool_use" {
 				activeTools[event.Index] = &toolBlock{
@@ -373,7 +493,35 @@ func (b *claudeBrain) Chat(ctx context.Context, messages []Message, tools []json
 			}
 		}
 	}
-	return &ChatResult{Content: full.String(), ToolCalls: streamToolCalls}, nil
+	return &ChatResult{Content: full.String(), ToolCalls: streamToolCalls, Usage: usage}, nil
+}
+
+// promptCaching reports whether this brain talks to Anthropic directly,
+// the only endpoint where cache_control markers are known-safe.
+func (b *claudeBrain) promptCaching() bool {
+	return strings.Contains(b.baseURL, "anthropic.com")
+}
+
+// markLastToolCacheable adds cache_control to the final tool definition
+// so the whole tools array (a stable, often multi-thousand-token block)
+// becomes one cache prefix together with the system prompt.
+func markLastToolCacheable(tools []json.RawMessage) []json.RawMessage {
+	if len(tools) == 0 {
+		return tools
+	}
+	var last map[string]interface{}
+	if err := json.Unmarshal(tools[len(tools)-1], &last); err != nil {
+		return tools
+	}
+	last["cache_control"] = cacheControl
+	b, err := json.Marshal(last)
+	if err != nil {
+		return tools
+	}
+	out := make([]json.RawMessage, len(tools))
+	copy(out, tools)
+	out[len(out)-1] = b
+	return out
 }
 
 func convertToolsToClaude(tools []json.RawMessage) []json.RawMessage {
@@ -431,7 +579,28 @@ type oaiReq struct {
 	MaxTokens   int               `json:"max_tokens,omitempty"`
 	Stream      bool              `json:"stream"`
 	Tools       []json.RawMessage `json:"tools,omitempty"`
+	// StreamOptions asks for a final `usage` chunk on streams. OpenAI,
+	// Ollama, Groq and DeepSeek all honour it; without it a streamed
+	// reply carries no token counts at all.
+	StreamOptions *oaiStreamOptions `json:"stream_options,omitempty"`
 }
+
+type oaiStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
+type oaiUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+}
+
+func (u *oaiUsage) toUsage() Usage {
+	if u == nil {
+		return Usage{}
+	}
+	return Usage{InputTokens: u.PromptTokens, OutputTokens: u.CompletionTokens}
+}
+
 type oaiMsg struct {
 	Role string `json:"role"`
 	// `content` must always serialize, even as "". OpenAI's own endpoint
@@ -479,6 +648,7 @@ type oaiResp struct {
 			} `json:"tool_calls"`
 		} `json:"delta"`
 	} `json:"choices"`
+	Usage *oaiUsage `json:"usage,omitempty"`
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
@@ -524,6 +694,9 @@ func (b *openAIBrain) Chat(ctx context.Context, messages []Message, tools []json
 		Model: b.model, Messages: oaiMsgs, Temperature: b.temperature,
 		MaxTokens: b.maxTokens, Stream: onChunk != nil, Tools: tools,
 	}
+	if onChunk != nil {
+		reqBody.StreamOptions = &oaiStreamOptions{IncludeUsage: true}
+	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, err
@@ -555,14 +728,16 @@ func (b *openAIBrain) Chat(ctx context.Context, messages []Message, tools []json
 			return nil, fmt.Errorf("decoding response: %w", err)
 		}
 		if len(chatResp.Choices) == 0 {
-			return &ChatResult{}, nil
+			return &ChatResult{Usage: chatResp.Usage.toUsage()}, nil
 		}
 		choice := chatResp.Choices[0].Message
-		return &ChatResult{Content: choice.Content, ToolCalls: choice.ToolCalls}, nil
+		return &ChatResult{Content: choice.Content, ToolCalls: choice.ToolCalls, Usage: chatResp.Usage.toUsage()}, nil
 	}
 	var full strings.Builder
+	var usage Usage
 	toolCallMap := make(map[int]*ToolCall)
 	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
@@ -573,7 +748,14 @@ func (b *openAIBrain) Chat(ctx context.Context, messages []Message, tools []json
 			break
 		}
 		var event oaiResp
-		if err := json.Unmarshal([]byte(data), &event); err != nil || len(event.Choices) == 0 {
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			continue
+		}
+		if event.Usage != nil {
+			usage = event.Usage.toUsage()
+		}
+		if len(event.Choices) == 0 {
+			// The usage-only trailer chunk has an empty choices array.
 			continue
 		}
 		delta := event.Choices[0].Delta
@@ -599,7 +781,7 @@ func (b *openAIBrain) Chat(ctx context.Context, messages []Message, tools []json
 			streamToolCalls = append(streamToolCalls, *tc)
 		}
 	}
-	return &ChatResult{Content: full.String(), ToolCalls: streamToolCalls}, nil
+	return &ChatResult{Content: full.String(), ToolCalls: streamToolCalls, Usage: usage}, nil
 }
 
 func NewBrain(provider, endpoint, model, apiKey string, temperature float64) Brain {

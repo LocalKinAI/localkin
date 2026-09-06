@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
+	"github.com/LocalKinAI/kinclaw/pkg/hooks"
 	"gopkg.in/yaml.v3"
 )
 
@@ -158,7 +160,40 @@ type Meta struct {
 		// kernel enforces max recursion depth = 1 via env-var guard.
 		// Default off; pilot souls opt in explicitly.
 		Spawn bool `yaml:"spawn"`
+
+		// Mode is the approval gate: "auto" (default — every exposed
+		// skill runs) or "ask" (calls matching Ask go to the human
+		// first: a terminal prompt in the REPL, an approval card in
+		// KinClaw Mac). Programmatic callers (spawn, harvest, macbench)
+		// keep auto so nothing blocks on a prompt nobody will answer.
+		Mode string `yaml:"mode"`
+		// Ask lists what needs approval in ask mode. Grammar: a skill
+		// name (`shell`), a prefix (`mcp_*`), or a skill with a
+		// primary-parameter prefix (`shell(git push*)`, `ui(click*)`).
+		// Empty means the default set: shell, file_write, file_edit,
+		// forge, mcp_*. Shell commands that look irreversible always
+		// ask in ask mode unless an Allow rule covers them.
+		Ask []string `yaml:"ask"`
+		// Allow lists calls that never prompt, same grammar. Checked
+		// before Ask, so `allow: [shell(git status*)]` carves an
+		// exception out of `ask: [shell]`.
+		Allow []string `yaml:"allow"`
 	} `yaml:"permissions"`
+	// Hooks are user shell commands run at fixed points of the loop
+	// (pre_tool / post_tool / stop). See pkg/hooks.
+	Hooks hooks.Config `yaml:"hooks"`
+	// Context tunes automatic compaction of a long conversation.
+	Context struct {
+		// CompactAt is the fraction of brain.context_length at which
+		// older messages are folded into a summary. Default 0.75.
+		CompactAt float64 `yaml:"compact_at"`
+		// KeepRecent is how many trailing messages survive a compaction
+		// verbatim. Default 8.
+		KeepRecent int `yaml:"keep_recent"`
+		// Disabled turns auto-compaction off (the /compact command and
+		// POST /api/compact still work).
+		Disabled bool `yaml:"disabled"`
+	} `yaml:"context"`
 	Skills struct {
 		Enable    []string `yaml:"enable"`
 		OutputDir string   `yaml:"output_dir"`
@@ -278,43 +313,168 @@ func ParseSoul(data []byte) (*Soul, error) {
 	prompt = strings.ReplaceAll(prompt, "{{lon}}", lon)
 	prompt = strings.ReplaceAll(prompt, "{{city}}", city)
 	prompt = strings.ReplaceAll(prompt, "{{country}}", country)
+	// Standing instructions the *user* wrote — the CLAUDE.md idea.
+	// Souls are identity and are shared; KINCLAW.md is this person's
+	// house rules ("always answer in 中文", "my repos live under
+	// ~/Documents/Workspace", "never touch Mail"). Two levels, global
+	// then per-directory, so a project can add to the global rules.
+	if instr := readUserInstructions(); instr != "" {
+		prompt += instr
+	}
 	// Inject the agent's persistent learning notebook if it exists. The
-	// agent writes to this file (via file_write) when it discovers an
-	// app's AX schema quirks, working matchers, or workflow gotchas;
+	// agent writes to this file (via the learn skill) when it discovers
+	// an app's AX schema quirks, working matchers, or workflow gotchas;
 	// kernel reads it back at every boot so prior lessons carry across
 	// sessions. Genesis Protocol's memory layer — "every user's KinClaw
 	// is unique after a month" — is grounded here.
 	if learned := readLearnedNotebook(); learned != "" {
-		prompt += "\n\n## 已学到的（across sessions, from ~/.kinclaw/learned.md）\n\n" + learned
+		prompt += "\n\n## 已学到的（across sessions, from " + LearnedPath() + "）\n\n" + learned
 	}
 	prompt += securitySuffix
 	return &Soul{Meta: meta, SystemPrompt: prompt}, nil
 }
 
-// readLearnedNotebook reads ~/.kinclaw/learned.md if it exists and
-// returns the trimmed content. Caps at 8KB so a runaway notebook can't
-// blow the agent's context. Empty string on any failure / missing file
-// — boot proceeds normally.
-func readLearnedNotebook() string {
+// LearnedPath is the canonical notebook location. The `learn` skill
+// writes here and the kernel reads here. (Before v1.18 the skill wrote
+// to ~/.localkin/learned.md while the kernel read ~/.kinclaw/learned.md
+// — every lesson since the v1.10 storage split was silently lost from
+// the prompt. The legacy file is still read, see readLearnedNotebook.)
+func LearnedPath() string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return ""
 	}
-	path := home + "/.kinclaw/learned.md"
-	data, err := os.ReadFile(path)
-	if err != nil {
+	return filepath.Join(home, ".kinclaw", "learned.md")
+}
+
+// legacyLearnedPath is the pre-v1.10 shared-family location that the
+// learn skill kept writing to. Read-only from here on.
+func legacyLearnedPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
 		return ""
 	}
-	const maxLearned = 8 * 1024
-	if len(data) > maxLearned {
-		// Keep the tail — most recent entries usually appended at the bottom.
-		data = data[len(data)-maxLearned:]
-		// Drop partial first line so we don't slice mid-character.
-		if i := bytes.IndexByte(data, '\n'); i >= 0 {
-			data = data[i+1:]
+	return filepath.Join(home, ".localkin", "learned.md")
+}
+
+// maxLearnedInPrompt bounds what the notebook may add to every call.
+const maxLearnedInPrompt = 8 * 1024
+
+// readLearnedNotebook returns the notebook text for the prompt: the
+// canonical file plus the legacy one (deduplicated by line), and when
+// the total exceeds the budget, a topic index followed by the most
+// recent tail. The index is the progressive-disclosure half: the model
+// always sees *which* apps it has notes on and can `learn action=recall
+// topic=…` for the ones the tail cut off, instead of silently losing
+// its oldest lessons.
+func readLearnedNotebook() string {
+	var parts [][]byte
+	for _, p := range []string{LearnedPath(), legacyLearnedPath()} {
+		if p == "" {
+			continue
+		}
+		if data, err := os.ReadFile(p); err == nil && len(bytes.TrimSpace(data)) > 0 {
+			parts = append(parts, data)
 		}
 	}
-	return strings.TrimSpace(string(data))
+	if len(parts) == 0 {
+		return ""
+	}
+	merged := mergeNotebooks(parts)
+	if len(merged) <= maxLearnedInPrompt {
+		return strings.TrimSpace(merged)
+	}
+	index := notebookIndex(merged)
+	tailBudget := maxLearnedInPrompt - len(index)
+	if tailBudget < 2048 {
+		tailBudget = 2048
+	}
+	tail := merged[len(merged)-tailBudget:]
+	if i := strings.IndexByte(tail, '\n'); i >= 0 {
+		tail = tail[i+1:]
+	}
+	return index + "\n\n…(older sections elided — `learn action=recall topic=<section>` to read one)…\n\n" + strings.TrimSpace(tail)
+}
+
+// mergeNotebooks concatenates notebook files, dropping bullet lines
+// already seen so the legacy file can't repeat the canonical one.
+func mergeNotebooks(parts [][]byte) string {
+	seen := map[string]bool{}
+	var sb strings.Builder
+	for _, data := range parts {
+		for _, line := range strings.Split(string(data), "\n") {
+			t := strings.TrimSpace(line)
+			if strings.HasPrefix(t, "- ") {
+				if seen[t] {
+					continue
+				}
+				seen[t] = true
+			}
+			sb.WriteString(line)
+			sb.WriteByte('\n')
+		}
+	}
+	return sb.String()
+}
+
+// notebookIndex lists every `## topic` header with its bullet count.
+func notebookIndex(text string) string {
+	type sec struct {
+		name  string
+		count int
+	}
+	var secs []sec
+	for _, line := range strings.Split(text, "\n") {
+		t := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(t, "## "):
+			secs = append(secs, sec{name: strings.TrimSpace(t[3:])})
+		case strings.HasPrefix(t, "- ") && len(secs) > 0:
+			secs[len(secs)-1].count++
+		}
+	}
+	var sb strings.Builder
+	sb.WriteString("**Notebook index** (topics with notes):\n")
+	for _, s := range secs {
+		fmt.Fprintf(&sb, "- %s (%d)\n", s.name, s.count)
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+// UserInstructionPaths are the KINCLAW.md locations, global first.
+func UserInstructionPaths() []string {
+	var out []string
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		out = append(out, filepath.Join(home, ".kinclaw", "KINCLAW.md"))
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		p := filepath.Join(cwd, "KINCLAW.md")
+		if len(out) == 0 || out[0] != p {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// maxInstructionBytes caps each KINCLAW.md; the file is human-written
+// so a runaway one is a mistake, not a feature.
+const maxInstructionBytes = 16 * 1024
+
+// readUserInstructions loads the KINCLAW.md files that exist and
+// returns them as a prompt section, or "" when there are none.
+func readUserInstructions() string {
+	var sb strings.Builder
+	for _, p := range UserInstructionPaths() {
+		data, err := os.ReadFile(p)
+		if err != nil || len(bytes.TrimSpace(data)) == 0 {
+			continue
+		}
+		if len(data) > maxInstructionBytes {
+			data = data[:maxInstructionBytes]
+		}
+		fmt.Fprintf(&sb, "\n\n## 用户的固定指令 (from %s)\n\n%s", p, strings.TrimSpace(string(data)))
+	}
+	return sb.String()
 }
 
 // SplitFrontmatter splits YAML frontmatter delimited by --- from the body.

@@ -203,7 +203,7 @@ ship as opt-in sidecars selected via env var:
 | `{{platform}}` | `runtime.GOOS` mapped to `macOS`/`Linux`/`Windows` |
 | `{{arch}}` | `runtime.GOARCH` (`arm64` / `amd64`) |
 | `{{location}}` `{{lat}}` `{{lon}}` `{{city}}` `{{country}}` | `$KINCLAW_LOCATION="lat,lon[,city[,country]]"` env var |
-| `## 已学到的` section | `~/.kinclaw/learned.md` (8KB tail) — **technical doctrine** across sessions |
+| `## 已学到的` section | `~/.kinclaw/learned.md` — **technical doctrine** across sessions (full file up to 8KB; beyond that a topic index + newest tail, `learn action=recall topic=X` for the rest) |
 | `## 用户长期记忆` section | `memories` k-v table in `~/.localkin/memory.db` — **user-facts** across sessions (v1.9+) |
 | Last 50 messages of `<soul-name>` session | `messages` table in `~/.localkin/memory.db` — **conversation continuity** across kinclaw restarts (v1.9+) |
 
@@ -250,7 +250,9 @@ nothing else writes here):
 
 | File | Purpose |
 |---|---|
-| `~/.kinclaw/learned.md` | technical doctrine across sessions (8KB tail injected at boot) |
+| `~/.kinclaw/learned.md` | technical doctrine across sessions (injected at boot; index + tail past 8KB) |
+| `~/.kinclaw/KINCLAW.md` | your standing instructions, appended to every soul prompt (v1.18) |
+| `~/.kinclaw/tool-results/` | oversized tool outputs spilled from the context (7-day prune) |
 | `~/.kinclaw/serve-sessions/<ts>.jsonl` | `kinclaw serve` event recordings (replayable) |
 | `~/.kinclaw/harvest/` | external skill candidates pulled by `kinclaw harvest` |
 | `~/.kinclaw/harvest.toml` | harvest source manifest |
@@ -344,6 +346,92 @@ Each uses the **embedded dylib pattern** (`purego` + `//go:embed`),
 so downstream users never need `clang` or `CGO_ENABLED`. See
 [Paper #9 on localkin.dev](https://www.localkin.dev/papers/embedded-dylib)
 for the full architectural story.
+
+## The harness — permission gate, plan mode, compaction, hooks (v1.18)
+
+Claws decide *what the agent can do*; the harness decides *how it is
+allowed to do it for hours at a time*. v1.18 adds the four habits that
+make Claude Code and Claude Desktop trustworthy, all opt-in per soul.
+
+### Permission gate
+
+```yaml
+permissions:
+  mode: ask            # default "auto" — existing souls are unchanged
+  ask:   ["shell", "file_write", "file_edit", "forge", "mcp_*"]
+  allow: ["shell(git status*)", "shell(ls*)", "file_write(~/.kinclaw*)"]
+```
+
+In `ask` mode a matching call stops and asks — a terminal prompt in the
+REPL, an approval card in KinClaw Mac (**Allow / Always this session /
+Deny**). Rule grammar: skill name, `prefix*`, or `skill(param-prefix*)`
+on the skill's primary parameter (`shell(git push*)`, `ui(click*)`,
+`file_write(~/.kinclaw*)`). `allow` beats `ask`. Shell commands that
+look irreversible (`rm -r`, `sudo`, `git push`, `kill`, `diskutil
+erase`, `curl … | sh`) always ask unless allowed. A denial becomes the
+tool result, so the model explains and adapts instead of retrying.
+GUI claws are not in the default ask set on purpose — in Cowork the
+clicking *is* the work. Scripts: `kinclaw -permissions auto`.
+
+### Plan mode
+
+`/plan` (REPL) or the clipboard button in KinClaw Mac. The agent may
+look — `screen screenshot`, `ui tree/find/read/watch`, `file_read`,
+web, `kinbrain`, `memory`, `todo_write` — but every mutating call is
+refused with "finish investigating, end with a numbered plan, wait for
+approval". Per action: `ui tree` passes, `ui click` doesn't.
+
+### Context compaction
+
+```yaml
+context:
+  compact_at: 0.75     # fraction of brain.context_length
+  keep_recent: 8       # trailing messages kept verbatim
+```
+
+When the provider-reported prompt size crosses the threshold, older
+messages are folded into a summary the model writes (goals, what was
+done, every path / URL / bundle id verbatim, todo state, open issues)
+and the session continues. `/compact` or `POST /api/compact` on demand.
+Old rows are archived under `"<soul>@<timestamp>"`, never deleted.
+`/usage` shows the numbers; KinClaw Mac shows a meter.
+
+### Hooks
+
+```yaml
+hooks:
+  pre_tool:
+    - match: "input"                  # skill name, prefix*, or empty = all
+      run: "./hooks/no-typing-while-zoom.sh"
+  post_tool:
+    - match: "shell"
+      run: "tee -a ~/.kinclaw/shell.log >/dev/null"
+  stop:
+    - run: "afplay /System/Library/Sounds/Glass.aiff"
+```
+
+Your shell commands at fixed points, JSON payload on stdin, Claude
+Code's exit protocol: `0` continue, `2` block (pre_tool: the call never
+runs and stderr is what the model sees), anything else logged and
+ignored. A deterministic rule you can write in five lines of bash beats
+a paragraph of prompt.
+
+### Standing instructions — `KINCLAW.md`
+
+`~/.kinclaw/KINCLAW.md` (global) and `./KINCLAW.md` (per directory) are
+appended to every soul's prompt. Souls are shared identity; this is your
+house rules.
+
+### `kinclaw memory`
+
+```
+kinclaw memory                 overview
+kinclaw memory list [-all]     durable facts
+kinclaw memory search <query>  facts + conversation history + notebook
+kinclaw memory forget <key>
+kinclaw memory learned [topic] the notebook (~/.kinclaw/learned.md)
+kinclaw memory sessions        live + archived conversation buckets
+```
 
 ## MCP servers — tools from outside this repo
 
@@ -1039,8 +1127,8 @@ cross-session memory.
 
 **Near-term v1.6+ candidates** (fluid):
 
-- **`kinclaw memory`** — list / search / forget against the
-  cross-session `~/.kinclaw/learned.md` (currently write-mostly).
+- ~~**`kinclaw memory`**~~ — shipped in v1.18 (list / search / forget /
+  learned / sessions).
 - **`kinclaw doctor`** — sidecar health check (TTS / STT / SearXNG /
   Playwright / kinrec). New-user pain point #1.
 - **Observer subscriptions** in `kinax-go` — push-based AX event

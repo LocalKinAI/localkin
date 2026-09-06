@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // --- Registry Tests ---
@@ -23,7 +25,7 @@ type mockSkill struct {
 }
 
 func (m *mockSkill) Name() string        { return m.name }
-func (m *mockSkill) Description() string  { return m.desc }
+func (m *mockSkill) Description() string { return m.desc }
 func (m *mockSkill) ToolDef() json.RawMessage {
 	return MakeToolDef(m.name, m.desc, nil, nil)
 }
@@ -267,7 +269,7 @@ func TestShellSkill_BlockedCommands(t *testing.T) {
 func TestShellSkill_PipeBlocklist(t *testing.T) {
 	s := NewShellSkill(5)
 	blocked := []struct {
-		cmd   string
+		cmd    string
 		interp string
 	}{
 		{"cat file | bash", "bash"},
@@ -827,10 +829,10 @@ Body
 // image bytes; text-only brains see the cleaned text without markers.
 func TestExtractImageMarkers(t *testing.T) {
 	tests := []struct {
-		name      string
-		input     string
-		wantText  string
-		wantImgs  []string
+		name     string
+		input    string
+		wantText string
+		wantImgs []string
 	}{
 		{
 			"no_markers",
@@ -1206,5 +1208,71 @@ func TestForgeSkill_AcceptsRealBinary(t *testing.T) {
 				t.Fatalf("expected accept for %q, got %v", cmd, err)
 			}
 		})
+	}
+}
+
+// --- Parallel safety ---
+
+type orderSkill struct {
+	name  string
+	mu    *sync.Mutex
+	order *[]string
+	delay time.Duration
+}
+
+func (o *orderSkill) Name() string             { return o.name }
+func (o *orderSkill) Description() string      { return o.name }
+func (o *orderSkill) ToolDef() json.RawMessage { return MakeToolDef(o.name, o.name, nil, nil) }
+func (o *orderSkill) Execute(map[string]string) (string, error) {
+	time.Sleep(o.delay)
+	o.mu.Lock()
+	*o.order = append(*o.order, o.name)
+	o.mu.Unlock()
+	return o.name, nil
+}
+
+func TestExecuteToolCalls_ExclusiveSkillsRunInOrder(t *testing.T) {
+	var mu sync.Mutex
+	var order []string
+	r := NewRegistry()
+	// "input" is exclusive and slow; "web_search" is fast. If the batch
+	// ran in parallel, web_search would finish first.
+	r.Register(&orderSkill{name: "input", mu: &mu, order: &order, delay: 40 * time.Millisecond})
+	r.Register(&orderSkill{name: "web_search", mu: &mu, order: &order})
+	res := ExecuteToolCalls(r, []ToolCallInfo{{ID: "1", Name: "input"}, {ID: "2", Name: "web_search"}})
+	if len(res) != 2 || res[0].Output != "input" || res[1].Output != "web_search" {
+		t.Fatalf("results out of order: %+v", res)
+	}
+	if len(order) != 2 || order[0] != "input" {
+		t.Fatalf("exclusive batch should execute sequentially, got %v", order)
+	}
+}
+
+func TestExecuteToolCalls_SafeSkillsRunConcurrently(t *testing.T) {
+	var mu sync.Mutex
+	var order []string
+	r := NewRegistry()
+	r.Register(&orderSkill{name: "kinbrain", mu: &mu, order: &order, delay: 40 * time.Millisecond})
+	r.Register(&orderSkill{name: "web_search", mu: &mu, order: &order})
+	start := time.Now()
+	ExecuteToolCalls(r, []ToolCallInfo{{ID: "1", Name: "kinbrain"}, {ID: "2", Name: "web_search"}})
+	if order[0] != "web_search" {
+		t.Fatalf("safe batch should run in parallel (fast one finishes first), got %v", order)
+	}
+	if time.Since(start) > 70*time.Millisecond {
+		t.Fatal("parallel batch took as long as sequential")
+	}
+}
+
+func TestParallelSafe(t *testing.T) {
+	for _, n := range []string{"ui", "input", "shell", "file_edit", "notes_pin", "music_play"} {
+		if ParallelSafe(n) {
+			t.Errorf("%s should be exclusive", n)
+		}
+	}
+	for _, n := range []string{"web_search", "kinbrain", "spawn", "memory", "mcp_fs_read", "weather"} {
+		if !ParallelSafe(n) {
+			t.Errorf("%s should be parallel-safe", n)
+		}
 	}
 }

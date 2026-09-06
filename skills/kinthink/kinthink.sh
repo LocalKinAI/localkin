@@ -290,4 +290,8 @@ if [ "$EXEC" = "1" ]; then
   printf '★ exec rc   : %d  (%dms)\n' "$RC" "$MS_EXEC"
   printf '★ TOTAL     : %dms  (router %dms + exec %dms)\n' \
     "$(( MS_MATCH + MS_EXEC ))" "$MS_MATCH" "$MS_EXEC"
+  # A matched-but-failed execution is a miss for the caller: exit with
+  # the cerebellum's code so the kernel falls through to the LLM
+  # instead of handing the user "ERR: missing argument" as the answer.
+  [ "$RC" -ne 0 ] && exit "$RC"
 fi

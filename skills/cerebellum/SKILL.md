@@ -49,7 +49,7 @@ command:
   - sh
   - -c
   - |
-    /Users/jackysun/Documents/Workspace/kinclaw/skills/cerebellum/cerebellum.sh "$1"
+    "$SKILL_DIR/cerebellum.sh" "$1"
   - "_"
 args:
   - "{{cmd}}"

@@ -155,19 +155,26 @@ func TestSaveMessage_WithToolCalls(t *testing.T) {
 			},
 		},
 	}
-	if err := store.SaveMessage(session, msg); err != nil {
-		t.Fatalf("SaveMessage with tool calls failed: %v", err)
+	// Tool calls only load back as part of a complete group (a lone
+	// tool_call is exactly what SanitizeHistory drops), so bracket it.
+	group := []brain.Message{
+		{Role: brain.RoleUser, Content: "check"},
+		msg,
+		{Role: brain.RoleTool, Content: "hi", ToolCallID: "tc-1"},
+	}
+	if err := store.SaveMessages(session, group); err != nil {
+		t.Fatalf("SaveMessages with tool calls failed: %v", err)
 	}
 
 	history := store.LoadHistory(session, 10)
-	if len(history) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(history))
+	if len(history) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(history))
 	}
-	if len(history[0].ToolCalls) != 1 {
-		t.Fatalf("expected 1 tool call, got %d", len(history[0].ToolCalls))
+	if len(history[1].ToolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(history[1].ToolCalls))
 	}
-	if history[0].ToolCalls[0].Function.Name != "shell" {
-		t.Errorf("expected tool name 'shell', got %q", history[0].ToolCalls[0].Function.Name)
+	if history[1].ToolCalls[0].Function.Name != "shell" {
+		t.Errorf("expected tool name 'shell', got %q", history[1].ToolCalls[0].Function.Name)
 	}
 }
 
@@ -175,21 +182,27 @@ func TestSaveMessage_WithToolCallID(t *testing.T) {
 	store := openTestDB(t)
 	session := "tool-result-test"
 
-	msg := brain.Message{
-		Role:       brain.RoleTool,
-		Content:    "hello",
-		ToolCallID: "tc-42",
+	// A tool result only survives LoadHistory as part of a complete
+	// group (user → assistant tool_call → tool result), so save the
+	// whole group and check the id round-trips on the last row.
+	call := brain.ToolCall{ID: "tc-42", Type: "function"}
+	call.Function.Name = "shell"
+	call.Function.Arguments = "{}"
+	group := []brain.Message{
+		{Role: brain.RoleUser, Content: "run it"},
+		{Role: brain.RoleAssistant, ToolCalls: []brain.ToolCall{call}},
+		{Role: brain.RoleTool, Content: "hello", ToolCallID: "tc-42"},
 	}
-	if err := store.SaveMessage(session, msg); err != nil {
-		t.Fatalf("SaveMessage with tool_call_id failed: %v", err)
+	if err := store.SaveMessages(session, group); err != nil {
+		t.Fatalf("SaveMessages with tool_call_id failed: %v", err)
 	}
 
 	history := store.LoadHistory(session, 10)
-	if len(history) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(history))
+	if len(history) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(history))
 	}
-	if history[0].ToolCallID != "tc-42" {
-		t.Errorf("expected tool_call_id 'tc-42', got %q", history[0].ToolCallID)
+	if history[2].ToolCallID != "tc-42" {
+		t.Errorf("expected tool_call_id 'tc-42', got %q", history[2].ToolCallID)
 	}
 }
 
@@ -348,5 +361,69 @@ func TestAllMemories_FiltersTransient(t *testing.T) {
 	}
 	if all[0].Key != "user_name" {
 		t.Errorf("expected user_name, got %q", all[0].Key)
+	}
+}
+
+func TestLoadHistory_SanitizesWindowOpeningMidToolGroup(t *testing.T) {
+	store := openTestDB(t)
+	sid := "sanitize-test"
+	tc := brain.ToolCall{ID: "call-1", Type: "function"}
+	tc.Function.Name = "ui"
+	tc.Function.Arguments = "{}"
+	msgs := []brain.Message{
+		{Role: brain.RoleUser, Content: "first"},
+		{Role: brain.RoleAssistant, ToolCalls: []brain.ToolCall{tc}},
+		{Role: brain.RoleTool, ToolCallID: "call-1", Content: "tree"},
+		{Role: brain.RoleAssistant, Content: "done"},
+		{Role: brain.RoleUser, Content: "second"},
+		{Role: brain.RoleAssistant, Content: "ok"},
+	}
+	for _, m := range msgs {
+		if err := store.SaveMessage(sid, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Limit 4 → window opens on the tool result (orphan).
+	got := store.LoadHistory(sid, 4)
+	if len(got) != 2 || got[0].Content != "second" {
+		t.Fatalf("expected sanitized tail [second, ok], got %+v", got)
+	}
+}
+
+func TestArchiveSessionAndSessions(t *testing.T) {
+	store := openTestDB(t)
+	store.SaveMessage("KinClaw Pilot", brain.Message{Role: brain.RoleUser, Content: "hi"})
+	store.SaveMessage("KinClaw Pilot", brain.Message{Role: brain.RoleAssistant, Content: "hello"})
+	archive, n, err := store.ArchiveSession("KinClaw Pilot")
+	if err != nil || n != 2 || !strings.HasPrefix(archive, "KinClaw Pilot@") {
+		t.Fatalf("archive: %q n=%d err=%v", archive, n, err)
+	}
+	if h := store.LoadHistory("KinClaw Pilot", 50); len(h) != 0 {
+		t.Fatalf("live key should be empty after archive, got %d", len(h))
+	}
+	if h := store.LoadHistory(archive, 50); len(h) != 2 {
+		t.Fatalf("archive should hold the rows, got %d", len(h))
+	}
+	sessions, err := store.Sessions()
+	if err != nil || len(sessions) != 1 || sessions[0].ID != archive || sessions[0].Messages != 2 {
+		t.Fatalf("sessions: %+v err=%v", sessions, err)
+	}
+}
+
+func TestListAndForgetMemories(t *testing.T) {
+	store := openTestDB(t)
+	store.Save("home_city", "Mountain View")
+	store.Save("_scratch", "tmp")
+	durable, _ := store.ListMemories(false)
+	all, _ := store.ListMemories(true)
+	if len(durable) != 1 || len(all) != 2 {
+		t.Fatalf("durable=%d all=%d", len(durable), len(all))
+	}
+	ok, err := store.Forget("home_city")
+	if err != nil || !ok {
+		t.Fatalf("forget: ok=%v err=%v", ok, err)
+	}
+	if ok, _ := store.Forget("home_city"); ok {
+		t.Fatal("second forget should report not found")
 	}
 }

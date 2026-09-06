@@ -1,17 +1,11 @@
 // serve.go — `kinclaw serve` subcommand.
 //
 // Spins up the chat-UI HTTP server (pkg/server) and bridges browser
-// chat → kernel turn → SSE events. The runTurn function below mirrors
-// chatLoop in main.go but reports through srv.Push instead of stdout
-// so every text delta + tool call + tool result becomes a UI event.
-//
-// Why a parallel loop instead of refactoring chatLoop to take a sink:
-// chatLoop's stdout shape (printing chunks directly + debug stderr)
-// is what the REPL and -exec depend on; serve mode wants structured
-// events with tool ids, image URL resolution, and forge-detection. A
-// duplicate ~80-line function is cleaner than a generic sink interface
-// every caller would have to construct, and keeps the REPL hot path
-// allocation-free.
+// chat → kernel turn → SSE events. The turn itself is runTurnCore in
+// turn.go — shared with the REPL — driven here through sseSink, which
+// turns every text delta, tool call and tool result into a UI event,
+// and serverAsker, which routes permission prompts to the connected
+// UIs instead of a stderr nobody is watching.
 package main
 
 import (
@@ -33,8 +27,10 @@ import (
 	"time"
 
 	"github.com/LocalKinAI/kinclaw/pkg/brain"
+	"github.com/LocalKinAI/kinclaw/pkg/compact"
 	"github.com/LocalKinAI/kinclaw/pkg/harvest"
 	"github.com/LocalKinAI/kinclaw/pkg/mcp"
+	"github.com/LocalKinAI/kinclaw/pkg/permission"
 	"github.com/LocalKinAI/kinclaw/pkg/server"
 	"github.com/LocalKinAI/kinclaw/pkg/skill"
 	"github.com/LocalKinAI/kinclaw/pkg/soul"
@@ -384,14 +380,15 @@ Flags:
 		return nil
 	}
 
-	// Session reset: wipe the conversation tape on the running session
-	// (in-memory history slice + sqlite messages rows) without touching
-	// soul/brain/skills/permissions. The Mac UI's "New session" button
-	// hits this so a stuck mid-task tool-call loop from a previous
-	// conversation can't bleed into the next "你好,你都能做什么" by
-	// having the model continue the old turn's plan. memories table
-	// (durable key/value) is intentionally NOT cleared — those are
-	// long-lived facts about the user that survive sessions.
+	// Session reset: start a new conversation on the running session
+	// without touching soul/brain/skills/permissions. The Mac UI's
+	// "New session" button hits this so a stuck mid-task tool-call
+	// loop from a previous conversation can't bleed into the next
+	// "你好,你都能做什么" by having the model continue the old turn's
+	// plan. The old rows are archived under "<soul>@<timestamp>", not
+	// deleted — still searchable, listed by `kinclaw memory sessions`.
+	// memories table (durable key/value) is intentionally NOT cleared —
+	// those are long-lived facts about the user that survive sessions.
 	sessionResetHandler := func() error {
 		if !turnMu.TryLock() {
 			return fmt.Errorf("turn in progress, cancel first (Esc) then reset")
@@ -405,11 +402,12 @@ Flags:
 		// length changes mid-flight (turnMu held = no readers in
 		// flight, but defense-in-depth).
 		s.history = nil
+		s.lastUsage = brain.Usage{}
 		sessMu.Unlock()
 
 		if s.store != nil {
-			if err := s.store.ClearSession(s.id); err != nil {
-				return fmt.Errorf("clear store: %w", err)
+			if _, _, err := s.store.ArchiveSession(s.id); err != nil {
+				return fmt.Errorf("archive session: %w", err)
 			}
 			// Also drop transient working memory ("_" prefix).
 			// Without this, AllMemories() at next-turn prompt-build
@@ -438,6 +436,61 @@ Flags:
 	srv.SetSoulHandlers(soulListHandler, soulSwitchHandler)
 	srv.SetBrainSwitchHandler(brainSwitchHandler)
 	srv.SetSessionResetHandler(sessionResetHandler)
+
+	// Permission prompts go to the UI, not the (invisible) stderr of a
+	// subprocess. Installed here because the asker needs the server,
+	// which doesn't exist when newSession builds the gate.
+	currentSess.gate.SetAsker(serverAsker{srv})
+
+	// GET /api/state — header data for a UI that just connected.
+	srv.SetStateHandler(func() server.State {
+		sessMu.Lock()
+		defer sessMu.Unlock()
+		s := currentSess
+		return server.State{
+			Soul:           s.soul.Meta.Name,
+			Brain:          fmt.Sprintf("%s/%s", s.soul.Meta.Brain.Provider, s.soul.Meta.Brain.Model),
+			Skills:         len(s.toolDefs),
+			PermissionMode: string(s.gate.Mode()),
+			PlanMode:       s.gate.PlanMode(),
+			SessionAllowed: s.gate.SessionAllowed(),
+			Messages:       len(s.history),
+			InputTokens:    s.lastUsage.Total(),
+			ContextLength:  s.soul.Meta.Brain.ContextLength,
+			TotalInput:     s.totalIn,
+			TotalOutput:    s.totalOut,
+		}
+	})
+
+	// POST /api/plan_mode — flip the read-only gate. Allowed mid-turn:
+	// it takes effect at the next tool call, which is exactly when a
+	// user who just saw the agent head somewhere unexpected wants it.
+	srv.SetPlanModeHandler(func(on bool) bool {
+		sessMu.Lock()
+		s := currentSess
+		sessMu.Unlock()
+		s.gate.SetPlanMode(on)
+		return s.gate.PlanMode()
+	})
+
+	// POST /api/compact — fold now. Refused mid-turn: the turn loop owns
+	// sess.history while it runs.
+	srv.SetCompactHandler(func() (string, error) {
+		if !turnMu.TryLock() {
+			return "", fmt.Errorf("turn in progress, cancel first (Esc) then compact")
+		}
+		defer turnMu.Unlock()
+		sessMu.Lock()
+		s := currentSess
+		sessMu.Unlock()
+		res, err := compactNow(ctx, s)
+		if err != nil {
+			return "", err
+		}
+		sseSink{srv}.compacted(res)
+		return fmt.Sprintf("%d messages folded, %d kept (~%d → ~%d tokens)",
+			res.Summarized, res.Kept, res.BeforeTokens, res.AfterTokens), nil
+	})
 
 	// GET /api/mcp — what the settings UI renders.
 	//
@@ -540,7 +593,7 @@ Flags:
 	if currentSess.registry != nil {
 		currentSess.registry.SetSpawnResultCallback(spawnResultCallback)
 	}
-	// Re-register on soul switch (newSession rebuilds registry).
+	// Re-register on soul switch (newSession rebuilds registry and gate).
 	prevSoulSwitch := soulSwitchHandler
 	soulSwitchHandler = func(p string) error {
 		if err := prevSoulSwitch(p); err != nil {
@@ -552,6 +605,7 @@ Flags:
 		if s.registry != nil {
 			s.registry.SetSpawnResultCallback(spawnResultCallback)
 		}
+		s.gate.SetAsker(serverAsker{srv})
 		return nil
 	}
 	srv.SetSoulHandlers(soulListHandler, soulSwitchHandler)
@@ -586,6 +640,7 @@ Flags:
 		Params: map[string]string{
 			"brain":  fmt.Sprintf("%s/%s", sess.soul.Meta.Brain.Provider, sess.soul.Meta.Brain.Model),
 			"skills": fmt.Sprintf("%d", len(sess.toolDefs)),
+			"mode":   string(sess.gate.Mode()),
 		},
 	}
 	srv.SetHello(helloEv)
@@ -616,135 +671,86 @@ Flags:
 	}
 }
 
-// runTurn drives one user → assistant → tool* → assistant cycle and
-// pushes structured events to the SSE stream. Direct port of chatLoop
-// (main.go) shaped for the UI: every text chunk emits text_delta,
-// every dispatched call emits tool_call, every result emits tool_result
+// sseSink turns a turn into SSE events: every text chunk becomes
+// text_delta, every dispatched call tool_call, every result tool_result
 // with image paths resolved to /file URLs the browser can fetch.
-func runTurn(ctx context.Context, sess *session, srv *server.Server, input string) {
-	userMsg := brain.Message{Role: brain.RoleUser, Content: input}
-	sess.history = append(sess.history, userMsg)
-	if sess.store != nil {
-		sess.store.SaveMessage(sess.id, userMsg)
-	}
+type sseSink struct{ srv *server.Server }
 
-	messages := buildMessages(sess.soul, sess.history)
-
-	onChunk := func(chunk string, thinking bool) error {
-		srv.Push(server.Event{Type: "text_delta", Text: chunk, Thinking: thinking})
-		return nil
-	}
-
-	var intermediateHistory []brain.Message
-	cb := skill.NewCircuitBreaker()
-	forgeFired := false
-
-	for round := 0; round < maxToolRounds; round++ {
-		result, err := sess.brain.Chat(ctx, messages, sess.toolDefs, onChunk)
-		if err != nil {
-			srv.Push(server.Event{Type: "error", Message: err.Error()})
-			persistHistory(sess, intermediateHistory)
-			srv.Push(server.Event{Type: "turn_done"})
-			return
-		}
-		if len(result.ToolCalls) == 0 {
-			// Final assistant message.
-			assistantMsg := brain.Message{Role: brain.RoleAssistant, Content: result.Content}
-			persistHistory(sess, intermediateHistory)
-			sess.history = append(sess.history, assistantMsg)
-			if sess.store != nil {
-				sess.store.SaveMessage(sess.id, assistantMsg)
-			}
-			if forgeFired {
-				sess.toolDefs = sess.registry.FilteredToolDefs(effectiveEnable(sess.soul))
-			}
-			srv.Push(server.Event{Type: "turn_done"})
-			return
-		}
-
-		assistantMsg := brain.Message{
-			Role: brain.RoleAssistant, Content: result.Content, ToolCalls: result.ToolCalls,
-		}
-		messages = append(messages, assistantMsg)
-		intermediateHistory = append(intermediateHistory, assistantMsg)
-
-		var callInfos []skill.ToolCallInfo
-		for _, tc := range result.ToolCalls {
-			if tc.Function.Name == "forge" {
-				forgeFired = true
-			}
-			params, perr := tc.ParseArguments()
-			if perr != nil {
-				toolMsg := brain.Message{
-					Role: brain.RoleTool, Content: "Error: " + perr.Error(), ToolCallID: tc.ID,
-				}
-				messages = append(messages, toolMsg)
-				intermediateHistory = append(intermediateHistory, toolMsg)
-				srv.Push(server.Event{
-					Type: "tool_error", ID: tc.ID, Name: tc.Function.Name, Message: perr.Error(),
-				})
-				continue
-			}
-			srv.Push(server.Event{
-				Type: "tool_call", ID: tc.ID, Name: tc.Function.Name, Params: params,
-			})
-			callInfos = append(callInfos, skill.ToolCallInfo{
-				ID: tc.ID, Name: tc.Function.Name, Params: params,
-			})
-		}
-
-		results := skill.ExecuteToolCalls(sess.registry, callInfos)
-
-		if tripped, tripMsg := cb.Record(results); tripped {
-			cbMsg := brain.Message{Role: brain.RoleUser, Content: tripMsg}
-			messages = append(messages, cbMsg)
-			intermediateHistory = append(intermediateHistory, cbMsg)
-			srv.Push(server.Event{Type: "error", Message: tripMsg})
-		}
-
-		for _, r := range results {
-			urls := make([]string, 0, len(r.Images))
-			for _, p := range r.Images {
-				if u := srv.FileURL(p); u != "" {
-					urls = append(urls, u)
-				}
-			}
-			// Pull video / image paths out of structured `path: ...` lines
-			// (record stop uses this shape; screen capture uses image://
-			// markers which already populated r.Images).
-			for _, p := range extractStructuredPaths(r.Output) {
-				if u := srv.FileURL(p); u != "" {
-					urls = append(urls, u)
-				}
-			}
-			srv.Push(server.Event{
-				Type: "tool_result", ID: r.ToolCallID, Name: r.Name,
-				Output: r.Output, Images: r.Images, URLs: urls,
-			})
-
-			toolMsg := brain.Message{
-				Role: brain.RoleTool, Content: r.Output, ToolCallID: r.ToolCallID,
-				Images: r.Images,
-			}
-			messages = append(messages, toolMsg)
-			intermediateHistory = append(intermediateHistory, toolMsg)
+func (s sseSink) text(chunk string, thinking bool) {
+	s.srv.Push(server.Event{Type: "text_delta", Text: chunk, Thinking: thinking})
+}
+func (s sseSink) toolCall(id, name string, params map[string]string) {
+	s.srv.Push(server.Event{Type: "tool_call", ID: id, Name: name, Params: params})
+}
+func (s sseSink) toolResult(r skill.ToolResult) {
+	urls := make([]string, 0, len(r.Images))
+	for _, p := range r.Images {
+		if u := s.srv.FileURL(p); u != "" {
+			urls = append(urls, u)
 		}
 	}
-
-	srv.Push(server.Event{
-		Type: "error", Message: fmt.Sprintf("too many tool rounds (max %d)", maxToolRounds),
+	// Pull video / image paths out of structured `path: ...` lines
+	// (record stop uses this shape; screen capture uses image://
+	// markers which already populated r.Images).
+	for _, p := range extractStructuredPaths(r.Output) {
+		if u := s.srv.FileURL(p); u != "" {
+			urls = append(urls, u)
+		}
+	}
+	s.srv.Push(server.Event{
+		Type: "tool_result", ID: r.ToolCallID, Name: r.Name,
+		Output: r.Output, Images: r.Images, URLs: urls,
 	})
-	persistHistory(sess, intermediateHistory)
-	srv.Push(server.Event{Type: "turn_done"})
 }
 
-func persistHistory(sess *session, history []brain.Message) {
-	for _, msg := range history {
-		if sess.store != nil {
-			sess.store.SaveMessage(sess.id, msg)
-		}
-		sess.history = append(sess.history, msg)
+// notice is its own event type on purpose. Circuit-breaker trips used
+// to go out as `error`, and every client treats `error` as "the turn
+// is over" — KinClaw Mac stops reading the stream on it — so a
+// mid-turn warning silently truncated the rest of the turn in the UI.
+func (s sseSink) notice(msg string) {
+	s.srv.Push(server.Event{Type: "notice", Message: msg})
+}
+func (s sseSink) usage(u brain.Usage, ctxLen int) {
+	s.srv.Push(server.Event{Type: "usage", InputTokens: u.Total(), OutputTokens: u.OutputTokens, ContextLength: ctxLen})
+}
+func (s sseSink) compacted(res compact.Result) {
+	s.srv.Push(server.Event{
+		Type: "compacted", BeforeTokens: res.BeforeTokens, AfterTokens: res.AfterTokens,
+		Message: fmt.Sprintf("%d messages folded into a summary (~%d → ~%d tokens)", res.Summarized, res.BeforeTokens, res.AfterTokens),
+		Output:  res.Summary,
+	})
+}
+
+// serverAsker routes permission requests to the connected UIs and
+// waits for POST /api/permission. The turn's ctx cancels the wait when
+// the user hits Stop.
+type serverAsker struct{ srv *server.Server }
+
+func (a serverAsker) Ask(ctx context.Context, req permission.Request) (permission.Answer, error) {
+	decision, err := a.srv.AskPermission(ctx, server.Event{
+		ID: req.ID, Name: req.Skill, Params: req.Params, Summary: req.Summary, Reason: req.Reason,
+	})
+	if err != nil {
+		return permission.Deny, err
 	}
+	switch decision {
+	case "allow":
+		return permission.AllowOnce, nil
+	case "allow_session":
+		return permission.AllowSession, nil
+	default:
+		return permission.Deny, nil
+	}
+}
+
+// runTurn drives one turn for the UI and always closes with turn_done.
+func runTurn(ctx context.Context, sess *session, srv *server.Server, input string) {
+	_, err := runTurnCore(ctx, sess, input, sseSink{srv})
+	if err != nil {
+		srv.Push(server.Event{Type: "error", Message: err.Error()})
+		sess.appendMessage(abortNote(err))
+	}
+	srv.Push(server.Event{Type: "turn_done"})
 }
 
 // extractStructuredPaths picks up `path: /abs/foo.mp4` lines from
