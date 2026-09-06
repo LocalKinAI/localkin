@@ -396,3 +396,33 @@ func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "message": msg})
 }
+
+// handleSearchStatus reports the last web_search outcome — which
+// backend answered, from which engines, which were down. No probing.
+func (s *Server) handleSearchStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if s.search == nil || s.search.Status == nil {
+		_ = json.NewEncoder(w).Encode(map[string]any{})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(s.search.Status())
+}
+
+// handleSearchProbe runs one restricted health check against the
+// meta-search on demand (POST, so nothing polls it by accident).
+func (s *Server) handleSearchProbe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if s.search == nil || s.search.Probe == nil {
+		http.Error(w, `{"error":"search probe not wired"}`, http.StatusNotImplemented)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(s.search.Probe())
+}

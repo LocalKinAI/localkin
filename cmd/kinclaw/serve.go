@@ -452,6 +452,19 @@ Flags:
 		return currentSess.setWorkspace(path)
 	})
 
+	// /api/search/* — the search-health indicator. Status is the record
+	// of the last real web_search (no traffic); probe is one restricted
+	// search on demand, never on a timer.
+	srv.SetSearchHandlers(&server.SearchHandlers{
+		Status: func() any {
+			return map[string]any{
+				"endpoint": skill.SearchEndpoint(),
+				"last":     skill.LastSearchStatus(),
+			}
+		},
+		Probe: func() any { return skill.ProbeSearXNG(skill.SearchEndpoint()) },
+	})
+
 	// /api/routines — scheduled one-shot runs, installed as LaunchAgents
 	// with this helper's discovery env so they see the same skills.
 	rm := routine.DefaultManager()

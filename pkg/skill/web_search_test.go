@@ -1,6 +1,7 @@
 package skill
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -136,5 +137,45 @@ func TestStripHTML(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("stripHTML(%q) = %q, want %q", tt.input, got, tt.want)
 		}
+	}
+}
+
+func TestSearXNG_RecordsStatusAndNotesDownEngines(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/search":
+			fmt.Fprint(w, `{"results":[{"url":"https://x","title":"Mountain","content":"c","engine":"wiby"},{"url":"https://y","title":"B","content":"d","engine":"bing"}],"unresponsive_engines":[["duckduckgo","CAPTCHA"],["brave","Suspended: too many requests"]]}`)
+		case "/config":
+			fmt.Fprint(w, `{"version":"2026.2.16","engines":[{"name":"google","enabled":false,"categories":["general"]},{"name":"bing","enabled":true,"categories":["general"]},{"name":"duckduckgo","enabled":true,"categories":["general"]},{"name":"wiby","enabled":true,"categories":["general"]}]}`)
+		}
+	}))
+	defer srv.Close()
+
+	s := &webSearchSkill{searxngEndpoint: srv.URL}
+	out, err := s.Execute(map[string]string{"query": "mountain view farmers market"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "note: 2 engine(s) unavailable") || !strings.Contains(out, "duckduckgo (CAPTCHA)") || !strings.Contains(out, "come only from: bing, wiby") {
+		t.Fatalf("missing health note:\n%s", out)
+	}
+	st := LastSearchStatus()
+	if st == nil || st.Results != 2 || st.Engines["wiby"] != 1 || len(st.Unresponsive) != 2 || st.Backend != "searxng" {
+		t.Fatalf("status: %+v", st)
+	}
+
+	p := ProbeSearXNG(srv.URL)
+	if !p.Reachable || p.Version != "2026.2.16" {
+		t.Fatalf("probe: %+v", p)
+	}
+	byName := map[string]EngineProbe{}
+	for _, e := range p.Engines {
+		byName[e.Name] = e
+	}
+	if byName["google"].Status != "disabled" || byName["duckduckgo"].Status != "down" || byName["bing"].Status != "ok" || byName["startpage"].Status != "untested" {
+		t.Fatalf("engine states: %+v", byName)
+	}
+	if p.Healthy != 1 {
+		t.Fatalf("healthy=%d", p.Healthy)
 	}
 }

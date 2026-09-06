@@ -51,6 +51,18 @@ A fourth answer to the permission gate. It writes a narrow rule —
 list at boot. `/permissions save <rule>` does the same by hand. Session
 approvals still exist for the cautious.
 
+### Added — search health (`/api/search/status`, `/api/search/probe`)
+
+`web_search` now records what each SearXNG call actually got — which
+engines answered, which were CAPTCHA'd / rate-limited / denied and why —
+and prefixes weak results with a note naming the down engines, so the
+model stops treating wiby's output as an answer. `GET /api/search/status`
+returns the last real outcome (no traffic); `POST /api/search/probe`
+runs one search restricted to the major engines and reports each as ok /
+down / empty / disabled. Diagnosed 2026-09-05: every major engine on the
+local instance was suspended and google was disabled, leaving wiby and
+bpb to fill the results.
+
 ### Added — routines (`kinclaw routine`, `/api/routines`)
 
 Scheduled one-shot runs on launchd — Claude Desktop's scheduled tasks.

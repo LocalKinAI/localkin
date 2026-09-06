@@ -141,6 +141,14 @@ type RoutineInfo struct {
 	CreatedAt string `json:"created_at"`
 }
 
+// SearchHandlers back /api/search/status (last real search outcome)
+// and /api/search/probe (an on-demand health check). Payloads are
+// opaque here — pkg/skill owns the shapes.
+type SearchHandlers struct {
+	Status func() any
+	Probe  func() any
+}
+
 // StateHandler reports the live session state.
 type StateHandler func() State
 
@@ -330,6 +338,7 @@ type Server struct {
 	compactHandler   CompactHandler
 	workspaceHandler WorkspaceHandler
 	routines         *RoutineHandlers
+	search           *SearchHandlers
 	accepts          *acceptRegistry
 	permissions      *permissionRegistry
 	allowedDirs      []string // /file allow-list (absolute, cleaned)
@@ -386,6 +395,9 @@ func (s *Server) SetWorkspaceHandler(h WorkspaceHandler) { s.workspaceHandler = 
 
 // SetRoutineHandlers wires the /api/routines endpoints.
 func (s *Server) SetRoutineHandlers(h *RoutineHandlers) { s.routines = h }
+
+// SetSearchHandlers wires /api/search/status and /api/search/probe.
+func (s *Server) SetSearchHandlers(h *SearchHandlers) { s.search = h }
 
 // AllowDir adds a directory to the /file allow-list at runtime (a newly
 // chosen workspace may hold screenshots the UI wants to render).
@@ -613,6 +625,8 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/api/routines/run", s.handleRoutineRun)
 	mux.HandleFunc("/api/routines/enable", s.handleRoutineEnable)
 	mux.HandleFunc("/api/routines/log", s.handleRoutineLog)
+	mux.HandleFunc("/api/search/status", s.handleSearchStatus)
+	mux.HandleFunc("/api/search/probe", s.handleSearchProbe)
 	mux.HandleFunc("/api/screen/current.jpg", s.handleLiveScreen)
 	mux.HandleFunc("/api/screen/info", s.handleLiveScreenInfo)
 	mux.HandleFunc("/api/voice/transcribe", s.handleVoiceTranscribe)
