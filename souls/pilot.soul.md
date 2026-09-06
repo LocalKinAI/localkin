@@ -4,7 +4,8 @@ version: "0.3.0"
 
 brain:
   provider: "ollama"
-  model: "kimi-k2.6:cloud"
+  model: "ornith-1.5:35b"                # 2026-09-05: Jacky's own model on the LAN box
+  endpoint: "http://192.168.0.21:11434"  # (was kimi-k2.6:cloud via laptop Ollama → Ollama Cloud, 429-prone)
   temperature: 0.3
   context_length: 131072
 
