@@ -17,6 +17,13 @@ import (
 const (
 	searchTimeout    = 10 * time.Second
 	searchMaxResults = 10
+	// probeTimeout is longer than searchTimeout because a probe is
+	// worth waiting for: it deliberately queries engines that may be
+	// failing, and SearXNG only reports an engine as down once its own
+	// per-engine timeout (up to 60s for a hung upstream) has elapsed.
+	// At 10s the whole probe timed out and every engine came back
+	// "untested" — the one answer a health check must never give.
+	probeTimeout = 75 * time.Second
 )
 
 var (
@@ -233,6 +240,10 @@ func (r *searxngResponse) unresponsive() []EngineDown {
 // the fan-out to those engines (the probe uses this so a health check
 // doesn't hit twenty upstreams).
 func querySearXNG(endpoint, query string, engines []string) (*searxngResponse, error) {
+	return querySearXNGTimeout(endpoint, query, engines, searchTimeout)
+}
+
+func querySearXNGTimeout(endpoint, query string, engines []string, timeout time.Duration) (*searxngResponse, error) {
 	u := endpoint + "/search?format=json&q=" + url.QueryEscape(query)
 	if len(engines) > 0 {
 		u += "&engines=" + url.QueryEscape(strings.Join(engines, ","))
@@ -243,7 +254,7 @@ func querySearXNG(endpoint, query string, engines []string) (*searxngResponse, e
 	}
 	req.Header.Set("Accept", "application/json")
 
-	client := &http.Client{Timeout: searchTimeout}
+	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("searxng request: %w", err)
@@ -346,7 +357,7 @@ func ProbeSearXNG(endpoint string) Probe {
 		p.Error = "no SEARXNG_ENDPOINT configured; web_search uses the DuckDuckGo HTML fallback only"
 		return p
 	}
-	client := &http.Client{Timeout: searchTimeout}
+	client := &http.Client{Timeout: probeTimeout}
 	resp, err := client.Get(endpoint + "/config")
 	if err != nil {
 		p.Error = "unreachable: " + err.Error()
@@ -395,7 +406,7 @@ func ProbeSearXNG(endpoint string) Probe {
 	if len(toTest) == 0 {
 		return p
 	}
-	raw, err := querySearXNG(endpoint, "kinclaw search health", toTest)
+	raw, err := querySearXNGTimeout(endpoint, "kinclaw search health", toTest, probeTimeout)
 	if err != nil {
 		p.Error = err.Error()
 		return p

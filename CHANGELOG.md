@@ -51,6 +51,23 @@ A fourth answer to the permission gate. It writes a narrow rule —
 list at boot. `/permissions save <rule>` does the same by hand. Session
 approvals still exist for the cautious.
 
+### Fixed — the search instance itself (2026-09-05)
+
+The noise had three causes, all outside the model. (a) The local
+SearXNG image was six months old and its bing / duckduckgo scrapers had
+rotted. (b) `searxng-watchdog.sh` probed with a real `q=test` search
+every 5 minutes, fanning out to ~20 upstream engines — 200+ requests an
+hour from one IP, which is why brave and wikipedia rate-limited and
+duckduckgo and startpage served CAPTCHAs; the same script had also
+written `disabled: true` onto google after three CAPTCHA strikes and
+kept re-triggering it. (c) `wiby` and `bpb` were enabled in the general
+category and filled the gap with unrelated pages. Fixed by updating the
+image (2026.2.16 → 2026.9.5), enabling google, disabling the eleven
+noise engines, and rewriting the watchdog to check `/healthz` for
+liveness plus one major-engines-only search every 30 minutes, with
+Google auto-isolation off. Major engines answering went 1 → 7 and the
+query that prompted this now returns the market's own pages.
+
 ### Added — search health (`/api/search/status`, `/api/search/probe`)
 
 `web_search` now records what each SearXNG call actually got — which
