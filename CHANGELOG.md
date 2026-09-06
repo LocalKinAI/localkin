@@ -1,6 +1,39 @@
 # Changelog
 
-## [Unreleased] - 2026-09-05 (evening) — Cowork parity: workspace, ask_user, deferred tools, routines, persisted approvals
+## [1.18.0] - 2026-09-05
+
+The release where the kernel grew a harness. Since v1.17.0 (the
+cross-platform port) kinclaw gained the habits that make an agent
+usable for hours rather than impressive for minutes:
+
+- **Permission gate** — allow / ask / deny per tool call, enforced by
+  the kernel, with plan mode, persisted "always" rules and an approval
+  card in KinClaw Mac.
+- **Context compaction** — a long session folds its own history into a
+  model-written summary instead of overflowing; real token accounting
+  from every provider.
+- **Hooks** — pre_tool / post_tool / stop shell commands, Claude Code's
+  exit-code protocol.
+- **Workspace** — a working folder that relative paths and shell
+  commands resolve against, and that writes outside of have to ask for.
+- **Deferred skills** — `skills.defer` + `tool_search` cut the pilot's
+  per-call tool schemas from 23 to 18 (~5K tokens).
+- **`ask_user`** — the agent asks a question with options instead of
+  guessing.
+- **Routines** — `kinclaw routine`, scheduled one-shot runs on launchd.
+- **`kinclaw memory`** — the memory you can finally read and curate.
+- **`KINCLAW.md`** — your standing instructions, per user and per repo.
+- **MCP client**, harvest verdict cache, `kinbrain` and `kinbrowser`
+  skills (from the 05-17 → 08-26 work below).
+
+Fixes worth naming: the `learn` skill had been writing to a file the
+kernel never read since May; resumed sessions could 400 on their first
+call; Ctrl-C used to kill every later turn in the REPL; the grep router
+returned failed executions as answers.
+
+Details, in the order they were written:
+
+## 2026-09-05 (evening) — Cowork parity: workspace, ask_user, deferred tools, routines, persisted approvals
 
 Second pass the same day, closing the product gaps left after the
 harness work: the things Claude Desktop does that a user notices.
@@ -93,7 +126,7 @@ Routines settings tab over the same registry.
 
 ---
 
-## [Unreleased] - 2026-09-05 — v1.18.0: the kernel learns from Claude Code
+## 2026-09-05 — the kernel learns from Claude Code (permission gate, compaction, hooks)
 
 The theme: kinclaw already had the claws; what it lacked were the
 *harness* habits that make Claude Code and Claude Desktop trustworthy
@@ -319,7 +352,7 @@ output}, `notice` {message}, `plan_mode` {plan_mode}. New endpoints:
 
 ---
 
-## [Unreleased] - 2026-08-26 — MCP servers, harvest that finishes, and a session bug behind both
+## 2026-08-26 — MCP servers, harvest that finishes, and a session bug behind both
 
 ### Added — Model Context Protocol client
 
@@ -435,7 +468,7 @@ soul, where git can see it.
 
 ---
 
-## [Unreleased] - 2026-05-20 — `kinbrowser` skill: fetch failures return content, not Go error
+## 2026-05-20 — `kinbrowser` skill: fetch failures return content, not Go error
 
 ### Bug observed in the wild
 
@@ -507,7 +540,7 @@ it's meant to detect.
 
 ---
 
-## [Unreleased] - 2026-05-20 — `kinbrowser` skill: markdown-native browser, replaces 5 web skills
+## 2026-05-20 — `kinbrowser` skill: markdown-native browser, replaces 5 web skills
 
 ### Why
 
@@ -606,7 +639,7 @@ binaries you can install independently.
 
 ---
 
-## [Unreleased] - 2026-05-17 — kinbrain skill: pass `--limit 50` to keep tool-result payloads sane
+## 2026-05-17 — kinbrain skill: pass `--limit 50` to keep tool-result payloads sane
 
 ### Bug observed in the wild
 
@@ -654,7 +687,7 @@ sample, hint if truncated). Two consumers, two defaults. The CLI flag
 
 ---
 
-## [Unreleased] - 2026-05-17 — kinbrain: teach LLM grep semantics (anti-search-engine UX)
+## 2026-05-17 — kinbrain: teach LLM grep semantics (anti-search-engine UX)
 
 ### Bug observed in the wild
 
@@ -737,7 +770,7 @@ not better.
 
 ---
 
-## [Unreleased] - 2026-05-17 — kinbrain: doc fix for env var rename
+## 2026-05-17 — kinbrain: doc fix for env var rename
 
 Followup to the same-day `kinbrain` skill commit. The kinbrain CLI it
 shells out to renamed its env var `LOCALKIN_HOME` → `LOCALKIN_REPO`
@@ -766,7 +799,7 @@ later reading kinclaw docs that reference `$LOCALKIN_HOME`.
 
 ---
 
-## [Unreleased] - 2026-05-17 — `kinbrain` skill: query Jacky's accumulated knowledge
+## 2026-05-17 — `kinbrain` skill: query Jacky's accumulated knowledge
 
 ### Why
 
