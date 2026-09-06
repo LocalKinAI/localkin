@@ -195,7 +195,13 @@ type Meta struct {
 		Disabled bool `yaml:"disabled"`
 	} `yaml:"context"`
 	Skills struct {
-		Enable    []string `yaml:"enable"`
+		Enable []string `yaml:"enable"`
+		// Defer lists enabled skills whose full schema is withheld from
+		// the model until it asks for them via tool_search. Same grammar
+		// as Enable. Cuts per-call prompt cost (the pilot's 23 schemas
+		// are ~12K tokens) and shortens the list a small model chooses
+		// from. Skills the soul uses on every task should not be here.
+		Defer     []string `yaml:"defer"`
 		OutputDir string   `yaml:"output_dir"`
 		Dir       string   `yaml:"dir"`
 	} `yaml:"skills"`

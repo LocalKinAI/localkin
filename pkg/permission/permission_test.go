@@ -3,6 +3,7 @@ package permission
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -190,5 +191,80 @@ func TestMatchesGrammar(t *testing.T) {
 	}
 	if Matches([]string{"weather(x*)"}, "weather", map[string]string{"x": "xyz"}) {
 		t.Fatal("skills without a primary param never match a paren rule")
+	}
+}
+
+func TestWorkspaceAndFilesystemRules(t *testing.T) {
+	a := &scriptedAsker{answer: Deny}
+	g := New(ModeAsk, []string{"shell"}, nil, a)
+	ws := t.TempDir()
+	g.SetWorkspace(ws)
+	g.SetFilesystem([]string{"/tmp/kinclaw-allowed"}, []string{"~/.ssh"})
+	ctx := context.Background()
+
+	if v := g.Check(ctx, "file_write", map[string]string{"path": "notes.md"}); !v.Allowed || v.Asked {
+		t.Fatalf("relative path inside workspace should pass: %+v", v)
+	}
+	if v := g.Check(ctx, "file_write", map[string]string{"path": "/tmp/kinclaw-allowed/x.txt"}); !v.Allowed {
+		t.Fatalf("fsAllow root should pass: %+v", v)
+	}
+	if v := g.Check(ctx, "file_edit", map[string]string{"path": "/tmp/elsewhere/x.txt"}); v.Allowed {
+		t.Fatalf("outside workspace should ask (and be denied here): %+v", v)
+	}
+	if got := a.seen[len(a.seen)-1].Reason; got != "writes outside the workspace" {
+		t.Fatalf("reason: %q", got)
+	}
+	home, _ := os.UserHomeDir()
+	v := g.Check(ctx, "file_write", map[string]string{"path": home + "/.ssh/config"})
+	if v.Allowed || v.Asked || !strings.Contains(v.Reason, "filesystem.deny") {
+		t.Fatalf("deny root must refuse without asking: %+v", v)
+	}
+	// Deny holds in auto mode too.
+	g2 := New(ModeAuto, nil, nil, nil)
+	g2.SetFilesystem(nil, []string{"~/.ssh"})
+	if v := g2.Check(ctx, "file_write", map[string]string{"path": home + "/.ssh/x"}); v.Allowed {
+		t.Fatal("deny root must hold in auto mode")
+	}
+}
+
+func TestAllowAlwaysPersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "permissions.json")
+	a := &scriptedAsker{answer: AllowAlways}
+	g := New(ModeAsk, nil, nil, a)
+	g.SetPersist(func(rule string) error { return SavePersisted(path, "KinClaw Pilot", rule) })
+	ctx := context.Background()
+	if v := g.Check(ctx, "shell", map[string]string{"command": "date +%s"}); !v.Allowed {
+		t.Fatalf("%+v", v)
+	}
+	rules := LoadPersisted(path, "KinClaw Pilot")
+	if len(rules) != 1 || rules[0] != "shell(date*)" {
+		t.Fatalf("persisted rules: %v", rules)
+	}
+	// Live gate now allows date without asking; a different command still asks.
+	if v := g.Check(ctx, "shell", map[string]string{"command": "date -u"}); !v.Allowed || v.Asked {
+		t.Fatalf("live rule should apply: %+v", v)
+	}
+	if v := g.Check(ctx, "shell", map[string]string{"command": "uptime"}); !v.Asked {
+		t.Fatalf("other commands still ask: %+v", v)
+	}
+	// Loaded into a fresh gate at boot.
+	g3 := New(ModeAsk, nil, LoadPersisted(path, "KinClaw Pilot"), nil)
+	if v := g3.Check(ctx, "shell", map[string]string{"command": "date"}); !v.Allowed {
+		t.Fatalf("fresh gate should honour persisted rule: %+v", v)
+	}
+	if LoadPersisted(path, "Other Soul") != nil {
+		t.Fatal("rules are per soul")
+	}
+}
+
+func TestSuggestAllowRule(t *testing.T) {
+	if r := SuggestAllowRule("shell", map[string]string{"command": "git push origin"}); r != "shell(git*)" {
+		t.Fatalf("got %q", r)
+	}
+	if r := SuggestAllowRule("file_write", map[string]string{"path": "/tmp/a/b.txt"}); r != "file_write(/tmp/a*)" {
+		t.Fatalf("got %q", r)
+	}
+	if r := SuggestAllowRule("mcp_fs_read", nil); r != "mcp_fs_read" {
+		t.Fatalf("got %q", r)
 	}
 }

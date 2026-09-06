@@ -76,7 +76,10 @@ func SafeEnv() []string {
 	return env
 }
 
-type shellSkill struct{ timeout time.Duration }
+type shellSkill struct {
+	timeout   time.Duration
+	workspace string
+}
 
 func NewShellSkill(timeoutSec int) Skill {
 	if timeoutSec <= 0 {
@@ -84,6 +87,9 @@ func NewShellSkill(timeoutSec int) Skill {
 	}
 	return &shellSkill{timeout: time.Duration(timeoutSec) * time.Second}
 }
+
+// SetWorkspace makes commands run inside the workspace directory.
+func (s *shellSkill) SetWorkspace(dir string) { s.workspace = dir }
 
 func (s *shellSkill) Name() string { return "shell" }
 func (s *shellSkill) Description() string {
@@ -138,6 +144,9 @@ func (s *shellSkill) Execute(params map[string]string) (string, error) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.Env = SafeEnv()
+	if s.workspace != "" {
+		cmd.Dir = s.workspace
+	}
 	out, err := cmd.CombinedOutput()
 	const maxOutput = 128 * 1024
 	result := string(out)
@@ -150,10 +159,11 @@ func (s *shellSkill) Execute(params map[string]string) (string, error) {
 	return result, nil
 }
 
-type fileReadSkill struct{}
+type fileReadSkill struct{ workspace string }
 
-func NewFileReadSkill() Skill              { return &fileReadSkill{} }
-func (s *fileReadSkill) Name() string      { return "file_read" }
+func NewFileReadSkill() Skill                    { return &fileReadSkill{} }
+func (s *fileReadSkill) SetWorkspace(dir string) { s.workspace = dir }
+func (s *fileReadSkill) Name() string            { return "file_read" }
 func (s *fileReadSkill) Description() string {
 	return "Read file contents (max 64KB). Always read a file before editing it."
 }
@@ -169,7 +179,7 @@ func (s *fileReadSkill) Execute(params map[string]string) (string, error) {
 	if path == "" {
 		return "", fmt.Errorf("path is required")
 	}
-	abs, err := filepath.Abs(expandTilde(path))
+	abs, err := resolvePath(path, s.workspace)
 	if err != nil {
 		return "", err
 	}
@@ -185,10 +195,11 @@ func (s *fileReadSkill) Execute(params map[string]string) (string, error) {
 	return content, nil
 }
 
-type fileWriteSkill struct{}
+type fileWriteSkill struct{ workspace string }
 
-func NewFileWriteSkill() Skill              { return &fileWriteSkill{} }
-func (s *fileWriteSkill) Name() string      { return "file_write" }
+func NewFileWriteSkill() Skill                    { return &fileWriteSkill{} }
+func (s *fileWriteSkill) SetWorkspace(dir string) { s.workspace = dir }
+func (s *fileWriteSkill) Name() string            { return "file_write" }
 func (s *fileWriteSkill) Description() string {
 	return "Write content to a file. OVERWRITES entire file. For partial edits use file_edit instead."
 }
@@ -206,23 +217,35 @@ func (s *fileWriteSkill) Execute(params map[string]string) (string, error) {
 	if path == "" {
 		return "", fmt.Errorf("path is required")
 	}
-	abs, err := filepath.Abs(expandTilde(path))
+	abs, err := resolvePath(path, s.workspace)
 	if err != nil {
 		return "", err
 	}
 	if err := os.MkdirAll(filepath.Dir(abs), 0755); err != nil {
 		return "", err
 	}
+	// Diff against what was there so the UI (and the model) sees what
+	// changed, not just that something did. A brand-new file shows as
+	// all additions.
+	previous := ""
+	if old, err := os.ReadFile(abs); err == nil {
+		previous = string(old)
+	}
 	if err := os.WriteFile(abs, []byte(content), 0644); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("Written %d bytes to %s", len(content), abs), nil
+	summary := fmt.Sprintf("Written %d bytes to %s", len(content), abs)
+	if d := UnifiedDiff(previous, content); d != "" {
+		return summary + "\n" + d, nil
+	}
+	return summary, nil
 }
 
-type fileEditSkill struct{}
+type fileEditSkill struct{ workspace string }
 
-func NewFileEditSkill() Skill              { return &fileEditSkill{} }
-func (s *fileEditSkill) Name() string      { return "file_edit" }
+func NewFileEditSkill() Skill                    { return &fileEditSkill{} }
+func (s *fileEditSkill) SetWorkspace(dir string) { s.workspace = dir }
+func (s *fileEditSkill) Name() string            { return "file_edit" }
 func (s *fileEditSkill) Description() string {
 	return "Edit a file by replacing exact text. The old_text must appear exactly once. Read the file first to get the exact text."
 }
@@ -240,7 +263,7 @@ func (s *fileEditSkill) Execute(params map[string]string) (string, error) {
 	if path == "" || oldText == "" {
 		return "", fmt.Errorf("path and old_text are required")
 	}
-	abs, err := filepath.Abs(expandTilde(path))
+	abs, err := resolvePath(path, s.workspace)
 	if err != nil {
 		return "", err
 	}
@@ -256,18 +279,24 @@ func (s *fileEditSkill) Execute(params map[string]string) (string, error) {
 	if count > 1 {
 		return "", fmt.Errorf("old_text found %d times, must be unique (provide more context)", count)
 	}
-	content = strings.Replace(content, oldText, newText, 1)
-	if err := os.WriteFile(abs, []byte(content), 0644); err != nil {
+	edited := strings.Replace(content, oldText, newText, 1)
+	if err := os.WriteFile(abs, []byte(edited), 0644); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("Edited %s: replaced 1 occurrence", abs), nil
+	summary := fmt.Sprintf("Edited %s: replaced 1 occurrence", abs)
+	if d := UnifiedDiff(content, edited); d != "" {
+		return summary + "\n" + d, nil
+	}
+	return summary, nil
 }
 
 type webFetchSkill struct{}
 
-func NewWebFetchSkill() Skill              { return &webFetchSkill{} }
-func (s *webFetchSkill) Name() string      { return "web_fetch" }
-func (s *webFetchSkill) Description() string  { return "Fetch a URL and return its content as readable text" }
+func NewWebFetchSkill() Skill         { return &webFetchSkill{} }
+func (s *webFetchSkill) Name() string { return "web_fetch" }
+func (s *webFetchSkill) Description() string {
+	return "Fetch a URL and return its content as readable text"
+}
 func (s *webFetchSkill) ToolDef() json.RawMessage {
 	return MakeToolDef("web_fetch", s.Description(),
 		map[string]map[string]string{
@@ -379,8 +408,8 @@ type MemoryBackend interface {
 
 type memorySkill struct{ store MemoryBackend }
 
-func NewMemorySkill(store MemoryBackend) Skill  { return &memorySkill{store: store} }
-func (s *memorySkill) Name() string             { return "memory" }
+func NewMemorySkill(store MemoryBackend) Skill { return &memorySkill{store: store} }
+func (s *memorySkill) Name() string            { return "memory" }
 func (s *memorySkill) Description() string {
 	return "Save or recall persistent memories. " +
 		"action=save: store a key-value fact. " +
@@ -446,8 +475,10 @@ type forgeSkill struct {
 	registry  *Registry
 }
 
-func NewForgeSkill(skillsDir string, registry *Registry) Skill { return &forgeSkill{skillsDir: skillsDir, registry: registry} }
-func (s *forgeSkill) Name() string                             { return "forge" }
+func NewForgeSkill(skillsDir string, registry *Registry) Skill {
+	return &forgeSkill{skillsDir: skillsDir, registry: registry}
+}
+func (s *forgeSkill) Name() string { return "forge" }
 func (s *forgeSkill) Description() string {
 	return "Create a new skill by generating a SKILL.md file in skills/<name>/. " +
 		"The new skill becomes immediately available next round." +

@@ -21,8 +21,10 @@ package permission
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -49,6 +51,10 @@ const (
 	// same skill for the life of the process — Claude Code's "yes, and
 	// don't ask again for this tool".
 	AllowSession
+	// AllowAlways also writes a rule (SuggestAllowRule) to the persisted
+	// allow list, so the answer survives restarts — Claude Code's
+	// "don't ask again" that lands in settings.json.
+	AllowAlways
 )
 
 // Request is what the human sees.
@@ -94,6 +100,15 @@ type Gate struct {
 	session  map[string]bool // skill names approved for the session
 	planMode bool
 	seq      int
+
+	// workspace, fsAllow and fsDeny scope file writes: writes under the
+	// workspace or an fsAllow root pass silently (subject to rules);
+	// writes elsewhere ask; writes under fsDeny are refused outright.
+	workspace string
+	fsAllow   []string
+	fsDeny    []string
+	// persist stores an AllowAlways rule; nil disables that answer.
+	persist func(rule string) error
 }
 
 // New builds a gate. ask and allow use the rule grammar (see rule):
@@ -125,6 +140,37 @@ func (g *Gate) PlanMode() bool { g.mu.Lock(); defer g.mu.Unlock(); return g.plan
 // `/permissions allow X` command, or an AllowSession answer).
 func (g *Gate) AllowSession(skill string) { g.mu.Lock(); g.session[skill] = true; g.mu.Unlock() }
 
+// AddAllowRule appends a rule to the live allow list.
+func (g *Gate) AddAllowRule(spec string) {
+	g.mu.Lock()
+	g.allow = append(g.allow, parseRules([]string{spec})...)
+	g.mu.Unlock()
+}
+
+// SetWorkspace sets the directory file writes may touch without asking.
+func (g *Gate) SetWorkspace(dir string) { g.mu.Lock(); g.workspace = dir; g.mu.Unlock() }
+
+// Workspace returns the current workspace directory.
+func (g *Gate) Workspace() string { g.mu.Lock(); defer g.mu.Unlock(); return g.workspace }
+
+// SetFilesystem installs the soul's permissions.filesystem allow / deny
+// roots. `~` is expanded.
+func (g *Gate) SetFilesystem(allow, deny []string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.fsAllow = g.fsAllow[:0]
+	for _, p := range allow {
+		g.fsAllow = append(g.fsAllow, expandTilde(strings.TrimSpace(p)))
+	}
+	g.fsDeny = g.fsDeny[:0]
+	for _, p := range deny {
+		g.fsDeny = append(g.fsDeny, expandTilde(strings.TrimSpace(p)))
+	}
+}
+
+// SetPersist installs the writer for AllowAlways answers.
+func (g *Gate) SetPersist(fn func(rule string) error) { g.mu.Lock(); g.persist = fn; g.mu.Unlock() }
+
 // SessionAllowed lists skills approved for the session, sorted.
 func (g *Gate) SessionAllowed() []string {
 	g.mu.Lock()
@@ -137,20 +183,49 @@ func (g *Gate) SessionAllowed() []string {
 	return out
 }
 
+// writesFiles reports whether a skill changes a file the user owns.
+func writesFiles(skill string) bool { return skill == "file_write" || skill == "file_edit" }
+
+// under reports whether path is root or inside it.
+func under(path, root string) bool {
+	if root == "" {
+		return false
+	}
+	root = filepath.Clean(root)
+	return path == root || strings.HasPrefix(path, root+string(filepath.Separator))
+}
+
 // Check decides one call. It blocks while an Asker is consulted.
 func (g *Gate) Check(ctx context.Context, skill string, params map[string]string) Verdict {
 	g.mu.Lock()
 	planMode, mode, asker := g.planMode, g.mode, g.asker
 	sessionOK := g.session[skill]
+	workspace, fsAllow, fsDeny := g.workspace, g.fsAllow, g.fsDeny
+	allowRules := g.allow
 	g.mu.Unlock()
 
 	if planMode && !ReadOnly(skill, params) {
 		return Verdict{Allowed: false, Reason: PlanModeDenial(skill)}
 	}
+
+	// permissions.filesystem.deny is absolute — it holds in auto mode
+	// too, and no allow rule or session approval overrides it. Reads
+	// are not gated: the shell skill already refuses the secret dirs,
+	// and a read-only agent that can't look at /etc is not safer.
+	target := ""
+	if writesFiles(skill) {
+		target = absPath(params["path"], workspace)
+		for _, d := range fsDeny {
+			if under(target, d) {
+				return Verdict{Allowed: false, Reason: fmt.Sprintf(
+					"Refused: %s is under %s, which permissions.filesystem.deny puts off limits.", target, d)}
+			}
+		}
+	}
 	if mode != ModeAsk {
 		return Verdict{Allowed: true}
 	}
-	if matchAny(g.allow, skill, params) || sessionOK {
+	if matchAny(allowRules, skill, params) || sessionOK {
 		return Verdict{Allowed: true}
 	}
 
@@ -162,6 +237,8 @@ func (g *Gate) Check(ctx context.Context, skill string, params map[string]string
 		reason = "default ask set (shell / file writes / forge / MCP)"
 	case skill == "shell" && DangerousShell(params["command"]):
 		reason = "shell command looks irreversible or system-wide"
+	case target != "" && !under(target, workspace) && !underAny(target, fsAllow):
+		reason = "writes outside the workspace"
 	default:
 		return Verdict{Allowed: true}
 	}
@@ -190,6 +267,18 @@ func (g *Gate) Check(ctx context.Context, skill string, params map[string]string
 	case AllowSession:
 		g.AllowSession(skill)
 		return Verdict{Allowed: true, Asked: true}
+	case AllowAlways:
+		rule := SuggestAllowRule(skill, params)
+		g.AddAllowRule(rule)
+		g.mu.Lock()
+		persist := g.persist
+		g.mu.Unlock()
+		if persist != nil {
+			if err := persist(rule); err != nil {
+				return Verdict{Allowed: true, Asked: true, Reason: "allowed; could not persist rule: " + err.Error()}
+			}
+		}
+		return Verdict{Allowed: true, Asked: true}
 	default:
 		return Verdict{Allowed: false, Asked: true, Reason: fmt.Sprintf(
 			"Permission denied by the user for %s. Do not retry the same call; "+
@@ -210,9 +299,16 @@ func defaultAsk(skill string) bool {
 	return strings.HasPrefix(skill, "mcp_")
 }
 
-func suggestAllowRule(skill string, params map[string]string) string {
+// SuggestAllowRule is the rule an "always" answer persists: the skill
+// plus the first word of its primary parameter (`shell(git*)`,
+// `file_write(/Users/me/notes*)`), never the bare skill for shell — one
+// "always" on `ls` must not silently approve `rm -rf` forever.
+func SuggestAllowRule(skill string, params map[string]string) string {
 	if p := primaryParam(skill); p != "" {
 		if v := strings.TrimSpace(params[p]); v != "" {
+			if p == "path" {
+				return fmt.Sprintf("%s(%s*)", skill, filepath.Dir(absPath(v, "")))
+			}
 			f := strings.Fields(v)
 			if len(f) > 0 {
 				return fmt.Sprintf("%s(%s*)", skill, f[0])
@@ -220,6 +316,36 @@ func suggestAllowRule(skill string, params map[string]string) string {
 		}
 	}
 	return skill
+}
+
+func suggestAllowRule(skill string, params map[string]string) string {
+	return SuggestAllowRule(skill, params)
+}
+
+// absPath expands ~ and resolves a relative path against the workspace
+// (or cwd), for comparisons against roots.
+func absPath(p, workspace string) string {
+	p = expandTilde(strings.TrimSpace(p))
+	if p == "" {
+		return ""
+	}
+	if !filepath.IsAbs(p) {
+		base := workspace
+		if base == "" {
+			base, _ = os.Getwd()
+		}
+		p = filepath.Join(base, p)
+	}
+	return filepath.Clean(p)
+}
+
+func underAny(path string, roots []string) bool {
+	for _, r := range roots {
+		if under(path, r) {
+			return true
+		}
+	}
+	return false
 }
 
 // ─── Rules ────────────────────────────────────────────────────────────
@@ -355,7 +481,7 @@ func ReadOnly(skill string, params map[string]string) bool {
 	switch skill {
 	case "file_read", "web_search", "web_fetch", "kinbrowser", "kinbrain",
 		"memory", "learn", "todo_write", "location", "weather", "translate",
-		"summarize", "stt":
+		"summarize", "stt", "ask_user", "tool_search":
 		return true
 	case "screen":
 		switch action {
@@ -471,4 +597,78 @@ func Summary(skill string, params map[string]string) string {
 		return string(r[:max]) + "…"
 	}
 	return s
+}
+
+// ─── Persisted allow rules ───────────────────────────────────────────
+
+// PersistedFile is the on-disk store for "always allow" answers:
+//
+//	{"souls": {"KinClaw Pilot": {"allow": ["shell(git*)", "file_write(/Users/me/notes*)"]}}}
+//
+// Per soul, because "always" was answered while a particular soul was
+// driving and a researcher soul should not inherit pilot's shell rules.
+type PersistedFile struct {
+	Souls map[string]struct {
+		Allow []string `json:"allow"`
+	} `json:"souls"`
+}
+
+// DefaultPersistPath is ~/.kinclaw/permissions.json.
+func DefaultPersistPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".kinclaw", "permissions.json")
+}
+
+// LoadPersisted returns the saved allow rules for a soul (nil if none).
+func LoadPersisted(path, soul string) []string {
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var f PersistedFile
+	if json.Unmarshal(data, &f) != nil {
+		return nil
+	}
+	return f.Souls[soul].Allow
+}
+
+// SavePersisted appends one rule for a soul, creating the file as needed.
+// Duplicates are ignored.
+func SavePersisted(path, soul, rule string) error {
+	if path == "" {
+		return fmt.Errorf("no permissions file path")
+	}
+	f := PersistedFile{Souls: map[string]struct {
+		Allow []string `json:"allow"`
+	}{}}
+	if data, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(data, &f)
+		if f.Souls == nil {
+			f.Souls = map[string]struct {
+				Allow []string `json:"allow"`
+			}{}
+		}
+	}
+	entry := f.Souls[soul]
+	for _, r := range entry.Allow {
+		if r == rule {
+			return nil
+		}
+	}
+	entry.Allow = append(entry.Allow, rule)
+	f.Souls[soul] = entry
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
 }

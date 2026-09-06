@@ -78,6 +78,124 @@ type session struct {
 	// the running sums for this process (/usage, /api/state).
 	lastUsage         brain.Usage
 	totalIn, totalOut int
+
+	// workspace is the directory relative paths resolve against and
+	// shell commands run in. Defaults to cwd; the UI's folder picker
+	// (POST /api/workspace) and /workspace change it.
+	workspace string
+	// deferred are enabled skills whose schema is withheld until
+	// tool_search loads them (skills.defer); loaded are the ones the
+	// model has pulled in this session.
+	deferred map[string]bool
+	loaded   map[string]bool
+	// questioner answers ask_user calls: terminal prompt or UI card.
+	// nil → the model is told nobody is there and to use its judgment.
+	questioner questioner
+}
+
+// questioner is the ask_user channel to a human.
+type questioner interface {
+	Ask(ctx context.Context, q skill.Question) (string, error)
+}
+
+// setWorkspace validates dir and propagates it to the skills that
+// resolve paths and to the permission gate.
+func (s *session) setWorkspace(dir string) (string, error) {
+	abs, err := skill.ValidWorkspace(dir)
+	if err != nil {
+		return "", fmt.Errorf("workspace %q: %w", dir, err)
+	}
+	s.workspace = abs
+	s.registry.SetWorkspace(abs)
+	if s.gate != nil {
+		s.gate.SetWorkspace(abs)
+	}
+	return abs, nil
+}
+
+// computeDeferred marks the enabled skills the soul defers.
+func (s *session) computeDeferred() {
+	s.deferred = map[string]bool{}
+	if s.loaded == nil {
+		s.loaded = map[string]bool{}
+	}
+	patterns := s.soul.Meta.Skills.Defer
+	if len(patterns) == 0 {
+		return
+	}
+	for _, name := range s.registry.AllNames() {
+		if name == skill.ToolSearchName || name == skill.AskUserName {
+			continue
+		}
+		if skill.MatchesAllow(patterns, name) && skill.MatchesAllow(effectiveEnable(s.soul), name) {
+			s.deferred[name] = true
+		}
+	}
+}
+
+// pendingDeferred lists deferred skills not yet loaded, sorted.
+func (s *session) pendingDeferred() []string {
+	var out []string
+	for name := range s.deferred {
+		if !s.loaded[name] {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// loadedSkills lists deferred skills the model has loaded, sorted.
+func (s *session) loadedSkills() []string {
+	var out []string
+	for name := range s.loaded {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// installToolSearch registers tool_search bound to this session.
+func (s *session) installToolSearch() {
+	s.registry.Register(skill.NewToolSearchSkill(s.registry, s.pendingDeferred, func(names []string) {
+		for _, n := range names {
+			s.loaded[n] = true
+		}
+	}))
+}
+
+// refreshToolDefs recomputes the tool list the model sees: the soul's
+// enable list, minus deferred skills not yet loaded, plus tool_search
+// whenever anything is deferred.
+func (s *session) refreshToolDefs() {
+	defs := s.registry.FilteredToolDefs(effectiveEnable(s.soul))
+	if len(s.deferred) == 0 {
+		s.toolDefs = defs
+		return
+	}
+	out := make([]json.RawMessage, 0, len(defs)+1)
+	for _, d := range defs {
+		name := toolDefName(d)
+		if s.deferred[name] && !s.loaded[name] {
+			continue
+		}
+		out = append(out, d)
+	}
+	if ts, err := s.registry.Get(skill.ToolSearchName); err == nil {
+		out = append(out, ts.ToolDef())
+	}
+	s.toolDefs = out
+}
+
+// toolDefName extracts function.name from an OpenAI-style tool def.
+func toolDefName(def json.RawMessage) string {
+	var t struct {
+		Function struct {
+			Name string `json:"name"`
+		} `json:"function"`
+	}
+	_ = json.Unmarshal(def, &t)
+	return t.Function.Name
 }
 
 // permissionModeFlag overrides the soul's permissions.mode when set
@@ -88,6 +206,8 @@ var permissionModeFlag string
 // newGate builds the session's permission gate from the soul plus the
 // CLI override, attaching the terminal approver when a human can
 // answer. serve mode swaps in its own asker once the server exists.
+// "Always" answers persist to ~/.kinclaw/permissions.json per soul and
+// are folded into the allow list at boot.
 func newGate(s *soul.Soul) *permission.Gate {
 	mode := permission.Mode(s.Meta.Permissions.Mode)
 	if permissionModeFlag != "" {
@@ -97,7 +217,22 @@ func newGate(s *soul.Soul) *permission.Gate {
 	if stdinIsTerminal() {
 		asker = cliAsker{}
 	}
-	return permission.New(mode, s.Meta.Permissions.Ask, s.Meta.Permissions.Allow, asker)
+	persistPath := permission.DefaultPersistPath()
+	allow := append([]string{}, s.Meta.Permissions.Allow...)
+	allow = append(allow, permission.LoadPersisted(persistPath, s.Meta.Name)...)
+	g := permission.New(mode, s.Meta.Permissions.Ask, allow, asker)
+	g.SetFilesystem(s.Meta.Permissions.Filesystem.Allow, s.Meta.Permissions.Filesystem.Deny)
+	soulName := s.Meta.Name
+	g.SetPersist(func(rule string) error { return permission.SavePersisted(persistPath, soulName, rule) })
+	return g
+}
+
+// newQuestioner is the terminal ask_user channel when a human can type.
+func newQuestioner() questioner {
+	if stdinIsTerminal() {
+		return cliQuestioner{}
+	}
+	return nil
 }
 
 // newHooks builds the hook runner, or nil when the soul has none.
@@ -128,6 +263,9 @@ func main() {
 		case "memory":
 			runMemory(os.Args[2:])
 			return
+		case "routine":
+			runRoutine(os.Args[2:])
+			return
 		}
 	}
 
@@ -138,6 +276,7 @@ Usage:
   kinclaw -soul PATH [-exec MSG]    Run a soul (REPL or one-shot)
   kinclaw serve [-soul PATH]         Chat UI · 看着 5 爪干活 (split-pane in browser)
   kinclaw memory [list|search|...]   See and curate what the agent remembers
+  kinclaw routine [list|add|...]     Schedule one-shot runs (launchd)
   kinclaw harvest                    Pull external skill libraries; coder forges
                                      KinClaw versions of good ideas; stage for review
   kinclaw harvest --review           Show staged candidates
@@ -150,7 +289,7 @@ Top-level flags:
 `)
 		flag.PrintDefaults()
 		fmt.Fprintf(flag.CommandLine.Output(), `
-Subcommand help: kinclaw serve -h  /  kinclaw memory -h  /  kinclaw harvest -h  /  kinclaw probe -h
+Subcommand help: kinclaw serve -h  /  kinclaw memory -h  /  kinclaw routine -h  /  kinclaw harvest -h  /  kinclaw probe -h
 `)
 	}
 
@@ -342,15 +481,22 @@ func newSession(soulPath string, debug bool, ephemeral bool) (*session, error) {
 		history = store.LoadHistory(sessionID, 50)
 	}
 
-	return &session{
+	sess := &session{
 		soul: s, brain: b, registry: reg,
-		toolDefs: reg.FilteredToolDefs(effectiveEnable(s)),
-		store:    store, id: sessionID, history: history,
+		store: store, id: sessionID, history: history,
 		debug: debug, soulPath: soulPath,
 		mcpClients: mcpClients, mcpResults: mcpResults, mcpConfig: mcpConfig,
-		gate:  newGate(s),
-		hooks: newHooks(s),
-	}, nil
+		gate:       newGate(s),
+		hooks:      newHooks(s),
+		questioner: newQuestioner(),
+	}
+	sess.installToolSearch()
+	sess.computeDeferred()
+	sess.refreshToolDefs()
+	if cwd, err := os.Getwd(); err == nil {
+		_, _ = sess.setWorkspace(cwd)
+	}
+	return sess, nil
 }
 
 // gateSuffix annotates the boot banner's Gate line.
@@ -432,6 +578,11 @@ func buildRegistry(s *soul.Soul, store *memory.SQLiteStore) (*skill.Registry, []
 	// renders both. Always registered (no soul flag) — soul controls
 	// access via permissions.skills.enable: ["todo_write"].
 	reg.Register(skill.NewTodoSkill())
+	// ask_user — the agent stops and asks the human a concrete question
+	// (options + free text) instead of guessing. Kernel-handled in the
+	// turn loop; registered here for its schema. Souls opt in via
+	// skills.enable: ["ask_user"].
+	reg.Register(skill.NewAskUserSkill())
 	// External skill discovery: scan an ordered list of directories,
 	// loading SKILL.md files from each. Same name in two dirs = the
 	// LATER dir wins (Registry's `r.skills[name] = s` last-write-wins),
@@ -800,6 +951,8 @@ func handleCommand(sess *session, input string) bool {
 			"/plan [on|off] Toggle plan mode (read-only tools until you approve)\n" +
 			"/permissions   Show the gate: mode, rules, session approvals\n" +
 			"/permissions allow <skill>   Approve a skill for the rest of this session\n" +
+			"/permissions save <rule>     Persist an allow rule (~/.kinclaw/permissions.json)\n" +
+			"/workspace [path]  Show or change the working folder\n" +
 			"/memory        What the agent remembers (also: kinclaw memory)\n" +
 			"/reload        Reload current soul file\n" +
 			"/soul          List or switch soul files\n" +
@@ -841,6 +994,17 @@ func handleCommand(sess *session, input string) bool {
 			fmt.Println("\033[2mPlan mode OFF.\033[0m")
 		}
 
+	case "/workspace":
+		if arg == "" {
+			fmt.Printf("\033[2m  Workspace: %s\033[0m\n", sess.workspace)
+			break
+		}
+		if ws, err := sess.setWorkspace(arg); err != nil {
+			fmt.Fprintf(os.Stderr, "\033[31m%v\033[0m\n", err)
+		} else {
+			fmt.Printf("\033[2m  Workspace: %s\033[0m\n", ws)
+		}
+
 	case "/permissions":
 		if strings.HasPrefix(arg, "allow ") {
 			name := strings.TrimSpace(strings.TrimPrefix(arg, "allow "))
@@ -848,11 +1012,22 @@ func handleCommand(sess *session, input string) bool {
 			fmt.Printf("\033[2m%s approved for this session.\033[0m\n", name)
 			break
 		}
+		if strings.HasPrefix(arg, "save ") {
+			rule := strings.TrimSpace(strings.TrimPrefix(arg, "save "))
+			sess.gate.AddAllowRule(rule)
+			if err := permission.SavePersisted(permission.DefaultPersistPath(), sess.soul.Meta.Name, rule); err != nil {
+				fmt.Fprintf(os.Stderr, "\033[31m%v\033[0m\n", err)
+				break
+			}
+			fmt.Printf("\033[2m%s saved to %s.\033[0m\n", rule, permission.DefaultPersistPath())
+			break
+		}
 		p := sess.soul.Meta.Permissions
-		fmt.Printf("\033[2m  Mode:     %s\n  Plan:     %v\n  Ask:      %s\n  Allow:    %s\n  Session:  %s\033[0m\n",
-			sess.gate.Mode(), sess.gate.PlanMode(),
+		fmt.Printf("\033[2m  Mode:      %s\n  Plan:      %v\n  Workspace: %s\n  Ask:       %s\n  Allow:     %s\n  Saved:     %s\n  Session:   %s\033[0m\n",
+			sess.gate.Mode(), sess.gate.PlanMode(), sess.workspace,
 			orNone(strings.Join(p.Ask, ", "), "(default set: shell, file_write, file_edit, forge, mcp_*)"),
 			orNone(strings.Join(p.Allow, ", "), "-"),
+			orNone(strings.Join(permission.LoadPersisted(permission.DefaultPersistPath(), sess.soul.Meta.Name), ", "), "-"),
 			orNone(strings.Join(sess.gate.SessionAllowed(), ", "), "-"))
 
 	case "/memory":
@@ -868,6 +1043,9 @@ func handleCommand(sess *session, input string) bool {
 			}
 			json.Unmarshal(def, &tool)
 			fmt.Printf("  \033[1m%-15s\033[0m %s\n", tool.Function.Name, truncate(tool.Function.Description, 60))
+		}
+		if pending := sess.pendingDeferred(); len(pending) > 0 {
+			fmt.Printf("  \033[2mdeferred (tool_search loads them): %s\033[0m\n", strings.Join(pending, ", "))
 		}
 
 	case "/clear":
@@ -909,9 +1087,12 @@ func handleCommand(sess *session, input string) bool {
 		sess.soul = s
 		sess.id = s.Meta.Name // keep in sync — soul rename would otherwise misroute saves
 		sess.swapRegistry(buildRegistry(s, sess.store))
-		sess.toolDefs = sess.registry.FilteredToolDefs(effectiveEnable(s))
 		sess.gate = newGate(s)
 		sess.hooks = newHooks(s)
+		sess.installToolSearch()
+		sess.computeDeferred()
+		sess.refreshToolDefs()
+		_, _ = sess.setWorkspace(sess.workspace)
 		fmt.Printf("\033[2mReloaded %s (%d skills)\033[0m\n", s.Meta.Name, len(sess.toolDefs))
 
 	case "/soul":
@@ -932,9 +1113,13 @@ func handleCommand(sess *session, input string) bool {
 			sess.soulPath = path
 			sess.id = s.Meta.Name // route saves under the new soul's bucket
 			sess.swapRegistry(buildRegistry(s, sess.store))
-			sess.toolDefs = sess.registry.FilteredToolDefs(effectiveEnable(s))
 			sess.gate = newGate(s)
 			sess.hooks = newHooks(s)
+			sess.loaded = nil
+			sess.installToolSearch()
+			sess.computeDeferred()
+			sess.refreshToolDefs()
+			_, _ = sess.setWorkspace(sess.workspace)
 			sess.lastUsage = brain.Usage{}
 			// Load the new soul's prior history — switching is opting
 			// into that soul's accumulated memory, not starting fresh.

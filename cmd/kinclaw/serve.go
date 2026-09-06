@@ -31,6 +31,7 @@ import (
 	"github.com/LocalKinAI/kinclaw/pkg/harvest"
 	"github.com/LocalKinAI/kinclaw/pkg/mcp"
 	"github.com/LocalKinAI/kinclaw/pkg/permission"
+	"github.com/LocalKinAI/kinclaw/pkg/routine"
 	"github.com/LocalKinAI/kinclaw/pkg/server"
 	"github.com/LocalKinAI/kinclaw/pkg/skill"
 	"github.com/LocalKinAI/kinclaw/pkg/soul"
@@ -437,10 +438,64 @@ Flags:
 	srv.SetBrainSwitchHandler(brainSwitchHandler)
 	srv.SetSessionResetHandler(sessionResetHandler)
 
-	// Permission prompts go to the UI, not the (invisible) stderr of a
-	// subprocess. Installed here because the asker needs the server,
-	// which doesn't exist when newSession builds the gate.
+	// Permission prompts and ask_user questions go to the UI, not the
+	// (invisible) stderr of a subprocess. Installed here because they
+	// need the server, which doesn't exist when newSession runs.
 	currentSess.gate.SetAsker(serverAsker{srv})
+	currentSess.questioner = serverQuestioner{srv}
+	srv.AllowDir(currentSess.workspace)
+
+	// POST /api/workspace — the folder picker.
+	srv.SetWorkspaceHandler(func(path string) (string, error) {
+		sessMu.Lock()
+		defer sessMu.Unlock()
+		return currentSess.setWorkspace(path)
+	})
+
+	// /api/routines — scheduled one-shot runs, installed as LaunchAgents
+	// with this helper's discovery env so they see the same skills.
+	rm := routine.DefaultManager()
+	routineEnv := func() routine.RunEnv {
+		sessMu.Lock()
+		s := currentSess
+		sessMu.Unlock()
+		return routineRunEnv(s.soulPath, s.workspace)
+	}
+	srv.SetRoutineHandlers(&server.RoutineHandlers{
+		List: func() ([]server.RoutineInfo, error) {
+			list, err := rm.List()
+			if err != nil {
+				return nil, err
+			}
+			out := make([]server.RoutineInfo, 0, len(list))
+			for _, r := range list {
+				out = append(out, routineInfo(rm, r))
+			}
+			return out, nil
+		},
+		Add: func(name, prompt, schedule, soulFile string) (server.RoutineInfo, error) {
+			env := routineEnv()
+			if soulFile == "" {
+				soulFile = env.SoulPath
+			}
+			r, err := rm.Add(routine.Routine{Name: name, Prompt: prompt, Soul: mustAbs(soulFile), Schedule: routine.Schedule{Raw: schedule}}, env)
+			info := server.RoutineInfo{}
+			if r.ID != "" {
+				info = routineInfo(rm, r)
+			}
+			return info, err
+		},
+		Remove: rm.Remove,
+		Run: func(id string) error {
+			r, ok := rm.Get(id)
+			if !ok {
+				return fmt.Errorf("no routine %q", id)
+			}
+			return runRoutineNow(rm, r, routineEnv())
+		},
+		SetEnabled: func(id string, on bool) error { return rm.SetEnabled(id, on, routineEnv()) },
+		Log:        func(id string) (string, error) { return routineLogTail(rm, id) },
+	})
 
 	// GET /api/state — header data for a UI that just connected.
 	srv.SetStateHandler(func() server.State {
@@ -459,6 +514,9 @@ Flags:
 			ContextLength:  s.soul.Meta.Brain.ContextLength,
 			TotalInput:     s.totalIn,
 			TotalOutput:    s.totalOut,
+			Workspace:      s.workspace,
+			Deferred:       s.pendingDeferred(),
+			Loaded:         s.loadedSkills(),
 		}
 	})
 
@@ -526,7 +584,8 @@ Flags:
 		// Recompute immediately: the whole point of an overlay is that it
 		// takes effect without a restart, unlike editing the soul.
 		sessMu.Lock()
-		s.toolDefs = s.registry.FilteredToolDefs(effectiveEnable(s.soul))
+		s.computeDeferred()
+		s.refreshToolDefs()
 		sessMu.Unlock()
 		return nil
 	})
@@ -606,6 +665,7 @@ Flags:
 			s.registry.SetSpawnResultCallback(spawnResultCallback)
 		}
 		s.gate.SetAsker(serverAsker{srv})
+		s.questioner = serverQuestioner{srv}
 		return nil
 	}
 	srv.SetSoulHandlers(soulListHandler, soulSwitchHandler)
@@ -738,9 +798,19 @@ func (a serverAsker) Ask(ctx context.Context, req permission.Request) (permissio
 		return permission.AllowOnce, nil
 	case "allow_session":
 		return permission.AllowSession, nil
+	case "allow_always":
+		return permission.AllowAlways, nil
 	default:
 		return permission.Deny, nil
 	}
+}
+
+// serverQuestioner routes ask_user questions to the connected UIs and
+// waits for POST /api/answer.
+type serverQuestioner struct{ srv *server.Server }
+
+func (q serverQuestioner) Ask(ctx context.Context, question skill.Question) (string, error) {
+	return q.srv.AskQuestion(ctx, server.Event{ID: question.ID, Message: question.Text, Options: question.Options})
 }
 
 // runTurn drives one turn for the UI and always closes with turn_done.

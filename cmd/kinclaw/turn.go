@@ -44,15 +44,40 @@ func compactConfig(sess *session) compact.Config {
 	}
 }
 
-// buildMessages assembles the prompt: system (soul + plan-mode
-// directive when on) followed by the live history.
+// buildMessages assembles the prompt: system (soul, workspace, deferred
+// skill index, plan-mode directive when on) followed by the live history.
 func buildMessages(sess *session) []brain.Message {
 	system := sess.soul.SystemPrompt
+	if sess.workspace != "" {
+		system += "\n\n## Workspace\n\n" + sess.workspace +
+			" — relative paths resolve here and shell commands run here. Writing outside it asks the user first."
+	}
+	system += skill.DeferredIndex(sess.registry, sess.pendingDeferred())
 	if sess.gate != nil && sess.gate.PlanMode() {
 		system += permission.PlanModeDirective
 	}
 	messages := []brain.Message{{Role: brain.RoleSystem, Content: system}}
 	return append(messages, sess.history...)
+}
+
+// askUser routes an ask_user call to the human, or tells the model
+// nobody is there. Never an error: the model must always get a result
+// it can act on.
+func (s *session) askUser(ctx context.Context, q skill.Question) string {
+	if strings.TrimSpace(q.Text) == "" {
+		return "ask_user needs a question."
+	}
+	if s.questioner == nil {
+		return "No interactive user is available to answer right now. Proceed with your best judgment, state the assumption you made, and repeat the question in your final reply."
+	}
+	answer, err := s.questioner.Ask(ctx, q)
+	if err != nil {
+		return fmt.Sprintf("The user did not answer (%v). Proceed with your best judgment and say which assumption you made.", err)
+	}
+	if strings.TrimSpace(answer) == "" {
+		return "The user sent an empty answer. Proceed with your best judgment and say so."
+	}
+	return "User answered: " + answer
 }
 
 // appendMessage adds m to the live history and the store.
@@ -145,7 +170,7 @@ func runTurnCore(ctx context.Context, sess *session, input string, sink turnSink
 		if len(result.ToolCalls) == 0 {
 			sess.appendMessage(brain.Message{Role: brain.RoleAssistant, Content: result.Content})
 			if forgeFired {
-				sess.toolDefs = sess.registry.FilteredToolDefs(effectiveEnable(sess.soul))
+				sess.refreshToolDefs()
 			}
 			if sess.hooks != nil && !sess.hooks.Empty() {
 				// Stop hooks are notifications; never hold the reply for them.
@@ -160,6 +185,16 @@ func runTurnCore(ctx context.Context, sess *session, input string, sink turnSink
 		})
 
 		results := runRound(ctx, sess, result.ToolCalls, sink, &forgeFired)
+
+		// tool_search loaded something: the next round's tool list must
+		// carry the new schemas, otherwise the model was told "callable
+		// from your next message" and it isn't.
+		for _, tc := range result.ToolCalls {
+			if tc.Function.Name == skill.ToolSearchName || (forgeFired && tc.Function.Name == "forge") || sess.deferred[tc.Function.Name] {
+				sess.refreshToolDefs()
+				break
+			}
+		}
 
 		if tripped, tripMsg := cb.Record(results); tripped {
 			sink.notice(tripMsg)
@@ -204,6 +239,33 @@ func runRound(ctx context.Context, sess *session, calls []brain.ToolCall, sink t
 			fmt.Fprintf(os.Stderr, "\033[2m[tool: %s %v]\033[0m\n", name, params)
 		}
 		sink.toolCall(tc.ID, name, params)
+
+		// ask_user is answered by a human, not a skill: it needs the
+		// turn's context and the front-end's prompt channel.
+		if name == skill.AskUserName {
+			answer := sess.askUser(ctx, skill.ParseQuestion(tc.ID, params))
+			results[i] = skill.ToolResult{ToolCallID: tc.ID, Name: name, Output: answer}
+			decided[i] = true
+			continue
+		}
+
+		// A deferred skill called before tool_search loaded it: load it
+		// now and hand the model the schema instead of "skill not
+		// found". Small models skip the search step; the parameters they
+		// guessed without a schema are not trusted, so the call itself
+		// is not executed.
+		if sess.deferred[name] && !sess.loaded[name] {
+			sess.loaded[name] = true
+			desc := ""
+			if sk, err := sess.registry.Get(name); err == nil {
+				desc = sk.Description()
+			}
+			results[i] = skill.ToolResult{ToolCallID: tc.ID, Name: name, Output: fmt.Sprintf(
+				"%s was deferred and is now loaded with its full schema (see your tool list). Call it again with the correct parameters.\n\n%s: %s",
+				name, name, desc)}
+			decided[i] = true
+			continue
+		}
 
 		// Hooks first: a deterministic user rule outranks a prompt.
 		if sess.hooks != nil {

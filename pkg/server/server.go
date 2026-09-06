@@ -79,6 +79,13 @@ type Event struct {
 	// preview; Output carries the full summary text.
 	BeforeTokens int `json:"before_tokens,omitempty"`
 	AfterTokens  int `json:"after_tokens,omitempty"`
+
+	// question (ask_user): Message is the question, Options the choices;
+	// answer via POST /api/answer with the same ID.
+	Options []string `json:"options,omitempty"`
+
+	// workspace: the directory file operations default to.
+	Workspace string `json:"workspace,omitempty"`
 }
 
 // State is the GET /api/state answer — enough for a UI to render its
@@ -97,6 +104,41 @@ type State struct {
 	// the /cost view.
 	TotalInput  int `json:"total_input_tokens"`
 	TotalOutput int `json:"total_output_tokens"`
+	// Workspace is the directory relative paths and shell commands use.
+	Workspace string `json:"workspace"`
+	// Deferred lists skills withheld until tool_search loads them; Loaded
+	// the ones the model has pulled in this session.
+	Deferred []string `json:"deferred,omitempty"`
+	Loaded   []string `json:"loaded,omitempty"`
+}
+
+// WorkspaceHandler changes the session workspace; returns the cleaned
+// path it settled on.
+type WorkspaceHandler func(path string) (string, error)
+
+// RoutineHandlers back the /api/routines endpoints.
+type RoutineHandlers struct {
+	List       func() ([]RoutineInfo, error)
+	Add        func(name, prompt, schedule, soul string) (RoutineInfo, error)
+	Remove     func(id string) error
+	Run        func(id string) error
+	SetEnabled func(id string, on bool) error
+	Log        func(id string) (string, error)
+}
+
+// RoutineInfo is one scheduled run as the UI sees it.
+type RoutineInfo struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Prompt    string `json:"prompt"`
+	Soul      string `json:"soul,omitempty"`
+	Schedule  string `json:"schedule"`     // human form
+	Raw       string `json:"schedule_raw"` // what was typed
+	Enabled   bool   `json:"enabled"`
+	Installed bool   `json:"installed"` // LaunchAgent present
+	LastRun   string `json:"last_run,omitempty"`
+	LogPath   string `json:"log_path"`
+	CreatedAt string `json:"created_at"`
 }
 
 // StateHandler reports the live session state.
@@ -286,6 +328,8 @@ type Server struct {
 	stateHandler     StateHandler
 	planModeHandler  PlanModeHandler
 	compactHandler   CompactHandler
+	workspaceHandler WorkspaceHandler
+	routines         *RoutineHandlers
 	accepts          *acceptRegistry
 	permissions      *permissionRegistry
 	allowedDirs      []string // /file allow-list (absolute, cleaned)
@@ -336,6 +380,29 @@ func (s *Server) SetPlanModeHandler(h PlanModeHandler) { s.planModeHandler = h }
 
 // SetCompactHandler wires POST /api/compact.
 func (s *Server) SetCompactHandler(h CompactHandler) { s.compactHandler = h }
+
+// SetWorkspaceHandler wires POST /api/workspace.
+func (s *Server) SetWorkspaceHandler(h WorkspaceHandler) { s.workspaceHandler = h }
+
+// SetRoutineHandlers wires the /api/routines endpoints.
+func (s *Server) SetRoutineHandlers(h *RoutineHandlers) { s.routines = h }
+
+// AllowDir adds a directory to the /file allow-list at runtime (a newly
+// chosen workspace may hold screenshots the UI wants to render).
+func (s *Server) AllowDir(dir string) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, d := range s.allowedDirs {
+		if d == abs {
+			return
+		}
+	}
+	s.allowedDirs = append(s.allowedDirs, abs)
+}
 
 // SetInterruptHandler wires the abort path. Optional — without it
 // DELETE /api/chat returns 501 and the UI's interrupt button fails
@@ -463,7 +530,10 @@ func (s *Server) FileURL(abs string) string {
 	if err != nil {
 		return ""
 	}
-	for _, dir := range s.allowedDirs {
+	s.mu.Lock()
+	dirs := append([]string(nil), s.allowedDirs...)
+	s.mu.Unlock()
+	for _, dir := range dirs {
 		if strings.HasPrefix(clean, dir+string(os.PathSeparator)) || clean == dir {
 			return "/file" + clean
 		}
@@ -537,6 +607,12 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/api/plan_mode", s.handlePlanMode)
 	mux.HandleFunc("/api/compact", s.handleCompact)
 	mux.HandleFunc("/api/permission", s.handlePermission)
+	mux.HandleFunc("/api/answer", s.handleAnswer)
+	mux.HandleFunc("/api/workspace", s.handleWorkspace)
+	mux.HandleFunc("/api/routines", s.handleRoutines)
+	mux.HandleFunc("/api/routines/run", s.handleRoutineRun)
+	mux.HandleFunc("/api/routines/enable", s.handleRoutineEnable)
+	mux.HandleFunc("/api/routines/log", s.handleRoutineLog)
 	mux.HandleFunc("/api/screen/current.jpg", s.handleLiveScreen)
 	mux.HandleFunc("/api/screen/info", s.handleLiveScreenInfo)
 	mux.HandleFunc("/api/voice/transcribe", s.handleVoiceTranscribe)

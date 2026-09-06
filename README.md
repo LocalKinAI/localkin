@@ -416,6 +416,44 @@ runs and stderr is what the model sees), anything else logged and
 ignored. A deterministic rule you can write in five lines of bash beats
 a paragraph of prompt.
 
+### Deferred skills — `skills.defer`
+
+```yaml
+skills:
+  enable: [screen, ui, input, shell, file_read, file_write, cerebellum, web_search, record, forge, tts, spawn, …]
+  defer:  [record, forge, tts, stt, web, web_scrape, browser_session, location, spawn]
+```
+
+Deferred skills cost one prompt line each until the model needs one;
+`tool_search query=…` (or just calling the skill) loads the full schema.
+On the pilot soul this trims ~5K of the ~12K tokens the tool schemas
+cost per call, and gives a small model a shorter list to choose from.
+
+### Workspace, `ask_user`, diffs
+
+- **Workspace** — the folder relative paths resolve in and shell runs
+  in (`/workspace`, `POST /api/workspace`, the folder button in KinClaw
+  Mac). In ask mode a write outside it asks first;
+  `permissions.filesystem.deny` is refused outright.
+- **`ask_user`** — the agent stops and asks a question with options
+  instead of guessing; a card in the Mac app, a prompt in the REPL.
+- **Diffs** — `file_edit` / `file_write` results carry a coloured
+  unified diff; the Mac app renders it expanded, like Claude Desktop.
+- **Always** — a fourth approval answer persists a narrow rule to
+  `~/.kinclaw/permissions.json` (`/permissions save <rule>` by hand).
+
+### Routines — `kinclaw routine`
+
+```
+kinclaw routine add -name "Morning brief" -at "weekdays 09:00" "总结今天日历和未读邮件"
+kinclaw routine list | remove ID | run ID | enable ID | disable ID | log ID
+```
+
+Scheduled one-shot runs on launchd (`-permissions auto`, logged to
+`~/.kinclaw/routines/<id>.log`). Schedules: `daily 09:00`, `weekdays
+09:00`, `weekly mon 09:00`, `hourly`, `every 30m`. Same registry as
+the Mac app's Routines tab.
+
 ### Standing instructions — `KINCLAW.md`
 
 `~/.kinclaw/KINCLAW.md` (global) and `./KINCLAW.md` (per directory) are

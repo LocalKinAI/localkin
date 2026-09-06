@@ -1,5 +1,69 @@
 # Changelog
 
+## [Unreleased] - 2026-09-05 (evening) — Cowork parity: workspace, ask_user, deferred tools, routines, persisted approvals
+
+Second pass the same day, closing the product gaps left after the
+harness work: the things Claude Desktop does that a user notices.
+
+### Added — deferred skills (`skills.defer`) and `tool_search`
+
+Measured on the pilot soul, the 23 tool schemas cost ~12K tokens per
+call, more than the 9K-token soul; ten rarely used ones (web, forge,
+record, spawn, browser_session, web_scrape, location, tts, stt,
+kinthink) were 5K of that. A soul can now list them under
+`skills.defer`: the system prompt carries one line per deferred skill
+(name and first sentence) and the full schema is sent only after the
+model calls `tool_search query=…` — or calls the skill directly, in
+which case the kernel loads it and hands back the schema instead of
+"skill not found". Fewer schemas also means a small model chooses from a
+shorter list. `/api/state` reports `deferred` and `loaded`.
+
+### Added — workspace
+
+The session has a working folder: relative paths in file_read / write /
+edit resolve there, shell commands run there, and in ask mode a write
+*outside* it (and outside `permissions.filesystem.allow`) asks first —
+Cowork's "the folder you granted" boundary. Defaults to cwd; `POST
+/api/workspace {path}` and `/workspace <path>` change it; the prompt
+names it. `permissions.filesystem.deny` is now enforced for writes in
+every mode (it was declared in souls but nothing read it).
+
+### Added — `ask_user`
+
+The agent can stop and ask one concrete question with 2–5 options (the
+user may type anything). Kernel-handled: REPL prompt, or a `question`
+SSE event answered by `POST /api/answer`. With no interactive user the
+model is told to proceed on its best judgment and say so. The pilot
+soul enables it.
+
+### Added — file edits show diffs
+
+`file_edit` and `file_write` results now end with a coloured unified
+diff (kincode's format, so KinClaw Mac's DiffView renders both kernels).
+A new file shows as additions; hunks keep three lines of context; output
+is capped at 200 lines.
+
+### Added — "Always" approvals persist
+
+A fourth answer to the permission gate. It writes a narrow rule —
+`shell(git*)`, `file_write(/Users/me/notes*)` — to
+`~/.kinclaw/permissions.json`, per soul, and folds it into the allow
+list at boot. `/permissions save <rule>` does the same by hand. Session
+approvals still exist for the cautious.
+
+### Added — routines (`kinclaw routine`, `/api/routines`)
+
+Scheduled one-shot runs on launchd — Claude Desktop's scheduled tasks.
+`kinclaw routine add -name "Morning brief" -at "weekdays 09:00" "prompt"`
+writes a LaunchAgent that runs `kinclaw -permissions auto -soul … -exec
+prompt` with this helper's discovery env, logging to
+`~/.kinclaw/routines/<id>.log`. Schedules: `daily 09:00`, `weekdays
+09:00`, `weekly mon 09:00`, `hourly`, `every 30m` (Chinese forms too).
+list / remove / run / enable / disable / log. The Mac app gets a
+Routines settings tab over the same registry.
+
+---
+
 ## [Unreleased] - 2026-09-05 — v1.18.0: the kernel learns from Claude Code
 
 The theme: kinclaw already had the claws; what it lacked were the

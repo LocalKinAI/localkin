@@ -155,6 +155,23 @@ skills:
     # ★ Paper #11 整合(2026-05-11)★
     - "cerebellum"       # 478 个 macOS 规范动作的总入口(15 类:finder/notes/mail/calendar/reminders/settings/safari/music/photos/maps/terminal/pages/numbers/keynote/multi/web)
     - "kinthink"         # NL → cerebellum 路由器(grep + TF-IDF + 槽位替换);kernel 通过 cerebellum.grep_route flag 已自动接管 chatLoop 前置调用
+    - "ask_user"         # 拿不准就问人:给 2-5 个选项,用户也可自由输入 (v1.18)
+  # ── 按需加载 (v1.18) ── 下面这些在 prompt 里只留一行名字+简介,模型要用时
+  # 先 tool_search 加载完整 schema。实测 23 个 schema ≈ 12K token/次,
+  # 这 10 个占 5K 多但日常极少用;列表短了小模型也更容易选对工具。
+  # 每个任务都要用的 (screen/ui/input/shell/file_*/cerebellum/kinbrowser/
+  # web_search/memory/learn/todo_write) 不要放进来。
+  defer:
+    - "record"
+    - "forge"
+    - "tts"
+    - "stt"
+    - "web"
+    - "web_scrape"
+    - "browser_session"
+    - "location"
+    - "spawn"
+    - "kinthink"
   output_dir: "~/Library/Caches/kinclaw/pilot"
 ---
 
